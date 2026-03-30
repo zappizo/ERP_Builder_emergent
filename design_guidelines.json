@@ -1,0 +1,100 @@
+{
+  "theme": "light",
+  "archetype": "4 (Swiss & High-Contrast)",
+  "emotional_tone": "Authoritative, intelligent, precise, clear, modern",
+  "design_philosophy": "Color is function only. 95% of the UI should be monochrome. High contrast with dense, technical spacing for a command-center feel.",
+  "colors": {
+    "background": "#F8F9FA",
+    "surface": "#FFFFFF",
+    "primary": "#0A0A0A",
+    "secondary": "#E5E7EB",
+    "accent": "#002EE6",
+    "success": "#10B981",
+    "warning": "#F59E0B",
+    "danger": "#EF4444",
+    "border": "rgba(0, 0, 0, 0.08)",
+    "text": {
+      "heading": "#0A0A0A",
+      "body": "#374151",
+      "muted": "#6B7280",
+      "inverse": "#FFFFFF"
+    }
+  },
+  "typography": {
+    "imports": [
+      "@import url('https://api.fontshare.com/v2/css?f[]=cabinet-grotesk@800,500,700,400&display=swap');",
+      "@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');"
+    ],
+    "heading_font": "'Cabinet Grotesk', sans-serif",
+    "body_font": "'IBM Plex Sans', sans-serif",
+    "mono_font": "'JetBrains Mono', monospace",
+    "scales": {
+      "h1": "text-4xl sm:text-5xl lg:text-6xl tracking-tighter font-black",
+      "h2": "text-2xl sm:text-3xl lg:text-4xl tracking-tight font-bold",
+      "h3": "text-xl sm:text-2xl tracking-tight font-bold",
+      "h4": "text-lg sm:text-xl tracking-tight font-semibold",
+      "body": "text-base leading-relaxed",
+      "small": "text-sm",
+      "overline": "text-xs uppercase tracking-[0.2em] font-medium"
+    }
+  },
+  "spacing_and_layout": {
+    "padding_scale": "Generous (p-4, p-6, p-8) for structural containers, Dense (p-2, p-3) for data/code blocks",
+    "grid_system": "Bento 'Control Room' Grid - grid-cols-1 md:grid-cols-3 lg:grid-cols-4 with gap-4 or gap-6",
+    "alignment": "Left-aligned for all paragraphs, labels, dense content, code, and chat bubbles. Optical alignment for icons.",
+    "borders": "Expose the skeleton. Technical grid look with border-r border-b border-border/40 for panels.",
+    "border_radius": "Sharp edges, cardless or max 4px (rounded-sm) border-radius"
+  },
+  "surface_strategies": {
+    "panels": "Flat solid background, 1px subtle border, no shadow.",
+    "chat_area": "Technical Look with Grid Borders.",
+    "code_viewer": "Retro-Futurism Terminal Look: Deep black background (#0A0A0A), JetBrains Mono text, subtle glowing border for active state.",
+    "sticky_header": "Optical Clarity Glassmorphism: bg-white/70 backdrop-blur-xl border-b border-black/5"
+  },
+  "motion_and_interaction": {
+    "hover": "-translate-y-0.5 shadow-sm border-black/20 text-black transition-all duration-200",
+    "active": "scale-[0.98] bg-black/5",
+    "focus": "ring-2 ring-accent ring-offset-2",
+    "loading": "Use The 'Tracing Beam' effect for pipeline progress. A glowing accent gradient line tracing the border.",
+    "page_transition": "opacity 0.2s ease, transform 0.2s ease"
+  },
+  "components": {
+    "buttons": "Flat, sharp corners. Primary: bg-primary text-white hover:bg-black/80. Secondary: bg-transparent border border-border text-primary hover:bg-black/5.",
+    "inputs": "Shadcn based. Sharp corners, border-border, focus-visible:ring-accent.",
+    "tabs": "Flat. Active tab gets a bold border-b-2 border-primary or accent, inactive tabs are text-muted hover:text-primary.",
+    "badges": "Square borders, text-xs uppercase tracking-widest.",
+    "cards": "Go cardless. Use rectangular, dense styles with right and bottom borders."
+  },
+  "media_and_assets": {
+    "icons": "lucide-react (Standard UI), or @phosphor-icons/react for dense dashboard moments.",
+    "image_urls": [
+      {
+        "url": "https://images.unsplash.com/photo-1764601841441-34ebb3d42a78?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NjZ8MHwxfHNlYXJjaHwxfHxhYnN0cmFjdCUyMGdlb21ldHJpYyUyMGxvZ28lMjBtaW5pbWFsaXN0fGVufDB8fHx8MTc3NDg2OTU4M3ww&ixlib=rb-4.1.0&q=85",
+        "category": "logo",
+        "description": "Abstract geometric logo for the Zappizo brand top left header"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1622169804256-0eb6873ff441?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2Nzd8MHwxfHNlYXJjaHwzfHxwcm9mZXNzaW9uYWwlMjBoZWFkc2hvdCUyMGF2YXRhcnxlbnwwfHx8fDE3NzQ4Njk1ODN8MA&ixlib=rb-4.1.0&q=85",
+        "category": "avatar",
+        "description": "User profile avatar for the top right corner or chat messages"
+      }
+    ]
+  },
+  "key_features_implementation": {
+    "Chat Interface": "Left-aligned sidebar panel (approx 30% width). Distinct user vs AI chat blocks. AI bubbles should have subtle 'Tracing Beam' border when generating.",
+    "ERP Architecture Preview": "Main central area. Tabbed navigation (Modules, DB Schema, API, Code). Use monospace fonts for DB and API tables.",
+    "Code Preview": "Deep black terminal-like panel with syntax highlighting. Use JetBrains Mono.",
+    "Version History & Pipeline": "Right-aligned collapsible drawer or top-level horizontal progress bar using 'Tracing Beam' active state.",
+    "JSON State Viewer": "Monospace tree-view component. High contrast syntax colors (Strings: green, Keys: blue, Numbers: orange)."
+  },
+  "instructions_to_main_agent": [
+    "Strictly follow the color palette. DO NOT use teal or purple-blue gradients.",
+    "Install and use `@phosphor-icons/react` or `lucide-react` for technical, sharp icons.",
+    "Implement the 'Bento Control Room' grid for the main layout. Ensure h-full on children to match neighbors.",
+    "Use Cabinet Grotesk for all headings. Never use Inter for headings.",
+    "All interactive elements MUST have `data-testid` attributes (e.g., `data-testid=\"chat-input\"`).",
+    "Avoid Shadcn 'Card' wrapper if it enforces rounded corners; use raw divs with `border-border/40` to create a grid/technical look.",
+    "Ensure minimum 4.5:1 contrast ratio for all text. The text colors specified meet this requirement.",
+    "Do not use generic empty states. Add actionable CTA buttons within the empty states."
+  ]
+}
