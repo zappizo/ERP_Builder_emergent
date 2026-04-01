@@ -3,10 +3,10 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import CodeViewer from "@/components/CodeViewer";
 import { getPipelineStage } from "@/lib/api";
-import { copyText, downloadFilesAsZip } from "@/lib/export";
+import { copyText, downloadFilesAsZip, downloadTextFile } from "@/lib/export";
 import { toast } from "sonner";
 import {
-  LayoutDashboard, Database, Globe, Code2, ShieldCheck, FileJson, Package,
+  LayoutDashboard, Database, Globe, Code2, ShieldCheck, FileJson, FileText, Package,
   Users, ShoppingCart, Briefcase, Settings, BarChart3, Layers, CheckCircle2,
   AlertTriangle, XCircle, Info, Download, Copy
 } from "lucide-react";
@@ -23,6 +23,335 @@ function getIcon(name) {
   return ICON_MAP[key] || Package;
 }
 
+function toProjectSlug(value, fallback = "ai-erp-builder") {
+  const normalized = String(value || "")
+    .trim()
+    .replace(/[<>:"/\\|?*\x00-\x1f]+/g, "-")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .toLowerCase();
+
+  return normalized || fallback;
+}
+
+function mergeBundleFiles(scaffoldFiles, generatedFiles) {
+  const fileMap = new Map();
+
+  [...scaffoldFiles, ...generatedFiles].forEach((file) => {
+    if (!file?.path) return;
+    fileMap.set(file.path, {
+      language: file.language || "text",
+      content: String(file.content ?? ""),
+      ...file,
+    });
+  });
+
+  return Array.from(fileMap.values());
+}
+
+function buildFrontendDownloadFiles(projectName, frontendCode) {
+  const generatedFiles = frontendCode?.files || [];
+  if (!generatedFiles.length) return [];
+
+  const appName = projectName || "AI ERP Builder";
+  const packageName = toProjectSlug(projectName, "ai-erp-builder-frontend");
+  const reactVersion = frontendCode?.dependencies?.react || "^18.3.1";
+  const routerVersion = frontendCode?.dependencies?.["react-router-dom"] || "^6.30.1";
+  const tailwindVersion = frontendCode?.dependencies?.tailwindcss || "^3.4.17";
+
+  const scaffoldFiles = [
+    {
+      path: "package.json",
+      language: "json",
+      content: JSON.stringify(
+        {
+          name: packageName,
+          private: true,
+          version: "0.1.0",
+          type: "module",
+          scripts: {
+            dev: "vite",
+            build: "vite build",
+            preview: "vite preview",
+          },
+          dependencies: {
+            react: reactVersion,
+            "react-dom": reactVersion,
+            "react-router-dom": routerVersion,
+          },
+          devDependencies: {
+            "@vitejs/plugin-react": "^4.3.1",
+            autoprefixer: "^10.4.20",
+            postcss: "^8.4.49",
+            tailwindcss: tailwindVersion,
+            vite: "^5.4.8",
+          },
+        },
+        null,
+        2,
+      ),
+    },
+    {
+      path: "index.html",
+      language: "html",
+      content: `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${appName}</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>`,
+    },
+    {
+      path: "vite.config.js",
+      language: "js",
+      content: `import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 3000,
+    proxy: {
+      "/api": "http://127.0.0.1:8001",
+    },
+  },
+});`,
+    },
+    {
+      path: "postcss.config.js",
+      language: "js",
+      content: `export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};`,
+    },
+    {
+      path: "tailwind.config.js",
+      language: "js",
+      content: `export default {
+  content: ["./index.html", "./src/**/*.{js,jsx,ts,tsx}"],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+};`,
+    },
+    {
+      path: "src/main.jsx",
+      language: "jsx",
+      content: `import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./App";
+import "./index.css";
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+);`,
+    },
+    {
+      path: "src/index.css",
+      language: "css",
+      content: `@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: #f8fafc;
+  color: #0f172a;
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}`,
+    },
+    {
+      path: ".env.example",
+      language: "text",
+      content: "VITE_API_BASE_URL=http://127.0.0.1:8001/api\n",
+    },
+    {
+      path: ".gitignore",
+      language: "text",
+      content: "node_modules/\ndist/\n.env\n",
+    },
+    {
+      path: "README.md",
+      language: "markdown",
+      content: `# ${appName} Frontend
+
+## Run
+1. npm install
+2. npm run dev
+
+## Notes
+- Generated frontend files are in \`src/\`
+- The dev server proxies \`/api\` to \`http://127.0.0.1:8001\`
+- Use the bundled JSON and Markdown specs from the root \`spec/\` folder as implementation reference
+`,
+    },
+  ];
+
+  return mergeBundleFiles(scaffoldFiles, generatedFiles);
+}
+
+function buildBackendDownloadFiles(projectName, backendCode) {
+  const generatedFiles = backendCode?.files || [];
+  if (!generatedFiles.length) return [];
+
+  const appName = projectName || "AI ERP Builder";
+  const dependencyLines = [];
+  const dependencies = backendCode?.dependencies || {};
+
+  Object.entries(dependencies).forEach(([name, version]) => {
+    dependencyLines.push(`${name}${version || ""}`);
+  });
+
+  if (!dependencyLines.some((line) => line.startsWith("uvicorn"))) {
+    dependencyLines.push("uvicorn[standard]>=0.30.0");
+  }
+  if (!dependencyLines.some((line) => line.startsWith("psycopg2-binary"))) {
+    dependencyLines.push("psycopg2-binary>=2.9.9");
+  }
+
+  const scaffoldFiles = [
+    {
+      path: "requirements.txt",
+      language: "text",
+      content: `${dependencyLines.join("\n")}\n`,
+    },
+    {
+      path: ".env.example",
+      language: "text",
+      content: "DATABASE_URL=postgresql://erp_user:erp_pass@localhost:5432/erp_builder\nCORS_ORIGINS=http://localhost:3000\n",
+    },
+    {
+      path: ".gitignore",
+      language: "text",
+      content: "__pycache__/\n*.pyc\n.venv/\n.env\n",
+    },
+    {
+      path: "README.md",
+      language: "markdown",
+      content: `# ${appName} Backend
+
+## Run
+1. python -m venv .venv
+2. .venv\\Scripts\\activate
+3. pip install -r requirements.txt
+4. uvicorn main:app --reload --port 8001
+
+## Notes
+- Generated backend files are stored in the backend root
+- Configure the database connection through \`.env\`
+- Use the root \`spec/\` folder for the blueprint JSON and Markdown build guide
+`,
+    },
+  ];
+
+  return mergeBundleFiles(scaffoldFiles, generatedFiles);
+}
+
+function buildCombinedDownloadFiles(projectName, masterJson, implementationMarkdown, frontendCode, backendCode) {
+  const specFiles = [
+    masterJson
+      ? { path: "spec/erp-blueprint.json", language: "json", content: JSON.stringify(masterJson, null, 2) }
+      : null,
+    implementationMarkdown
+      ? { path: "spec/erp-build-guide.md", language: "markdown", content: implementationMarkdown }
+      : null,
+  ].filter(Boolean);
+
+  const frontendDownloadFiles = buildFrontendDownloadFiles(projectName, frontendCode)
+    .map((file) => ({ ...file, path: `frontend/${file.path}` }));
+  const backendDownloadFiles = buildBackendDownloadFiles(projectName, backendCode)
+    .map((file) => ({ ...file, path: `backend/${file.path}` }));
+
+  return {
+    files: [...specFiles, ...frontendDownloadFiles, ...backendDownloadFiles],
+    hasCombinedBundle: frontendDownloadFiles.length > 0 && backendDownloadFiles.length > 0,
+  };
+}
+
+function CodeDownloadButton({ projectName, masterJson, implementationMarkdown, frontendCode, backendCode, prominent = false }) {
+  const [downloadedBundle, setDownloadedBundle] = useState(false);
+  const { files: combinedFiles, hasCombinedBundle } = buildCombinedDownloadFiles(
+    projectName,
+    masterJson,
+    implementationMarkdown,
+    frontendCode,
+    backendCode,
+  );
+
+  function archiveBaseName() {
+    return String(projectName || "ai-erp-builder")
+      .trim()
+      .replace(/[<>:"/\\|?*\x00-\x1f]+/g, "-")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "")
+      .toLowerCase();
+  }
+
+  function markDownloaded() {
+    setDownloadedBundle(true);
+    window.setTimeout(() => setDownloadedBundle(false), 2000);
+  }
+
+  function handleDownload() {
+    if (!hasCombinedBundle) {
+      toast.error("Both frontend and backend code need to be ready before downloading the full app ZIP.");
+      return;
+    }
+
+    try {
+      const baseName = archiveBaseName() || "ai-erp-builder";
+      downloadFilesAsZip(combinedFiles, {
+        archiveName: `${baseName}-full-codebase`,
+        rootFolder: baseName,
+      });
+      markDownloaded();
+      toast.success("Frontend and backend projects downloaded in one ZIP.");
+    } catch {
+      toast.error("Couldn't download the full app ZIP right now.");
+    }
+  }
+
+  return (
+    <button
+      data-testid={prominent ? "download-code-zip-btn-header" : "download-code-zip-btn"}
+      onClick={handleDownload}
+      disabled={!hasCombinedBundle}
+      className={`flex items-center gap-1.5 rounded-sm border px-3 py-1.5 text-sm transition-all ${
+        prominent
+          ? hasCombinedBundle
+            ? "border-[var(--zap-accent)] bg-[var(--zap-accent)] text-white hover:opacity-90"
+            : "border-[var(--zap-border)] bg-[var(--zap-bg)] text-[var(--zap-text-muted)] opacity-70 cursor-not-allowed"
+          : hasCombinedBundle
+            ? "border-[var(--zap-border)] text-[var(--zap-text-heading)] hover:border-[var(--zap-accent)] hover:text-[var(--zap-accent)]"
+            : "border-[var(--zap-border)] text-[var(--zap-text-muted)] opacity-50 cursor-not-allowed"
+      }`}
+    >
+      {downloadedBundle ? <CheckCircle2 className="h-3.5 w-3.5" /> : <Download className="h-3.5 w-3.5" />}
+      {downloadedBundle ? "Full app downloaded" : "Download full app ZIP"}
+    </button>
+  );
+}
+
 const TABS = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
   { id: "modules", label: "Modules", icon: Package },
@@ -31,23 +360,32 @@ const TABS = [
   { id: "code", label: "Code", icon: Code2 },
   { id: "review", label: "Review", icon: ShieldCheck },
   { id: "json", label: "JSON", icon: FileJson },
+  { id: "markdown", label: "MD File", icon: FileText },
 ];
+
+const EMPTY_PIPELINE = {};
+const TAB_STAGE_MAP = {
+  overview: "architecture",
+  modules: "architecture",
+  database: "architecture",
+  api: "architecture",
+  code: null,
+  review: "code_review",
+  json: "json_transform",
+  markdown: "json_transform",
+};
 
 export default function PreviewPanel({ project }) {
   const [activeTab, setActiveTab] = useState("overview");
   const [stageData, setStageData] = useState({});
   const [loadingStage, setLoadingStage] = useState(null);
-  const pipeline = project?.pipeline || {};
+  const pipeline = project?.pipeline ?? EMPTY_PIPELINE;
   const architecture = stageData.architecture?.output || pipeline.architecture?.output;
   const masterJson = stageData.json_transform?.output;
+  const implementationMarkdown = masterJson?.documentation?.erp_build_markdown || "";
   const frontendCode = stageData.frontend_generation?.output;
   const backendCode = stageData.backend_generation?.output;
   const review = stageData.code_review?.output;
-
-  const TAB_STAGE_MAP = {
-    overview: "architecture", modules: "architecture", database: "architecture",
-    api: "architecture", code: null, review: "code_review", json: "json_transform"
-  };
 
   const loadStageData = useCallback(async (stage) => {
     if (!project?.id || stageData[stage] || pipeline[stage]?.status !== "complete") return;
@@ -61,37 +399,62 @@ export default function PreviewPanel({ project }) {
 
   useEffect(() => {
     if (activeTab === "code") {
+      if (pipeline.json_transform?.status === "complete" && !stageData.json_transform) loadStageData("json_transform");
       if (pipeline.frontend_generation?.status === "complete" && !stageData.frontend_generation) loadStageData("frontend_generation");
       if (pipeline.backend_generation?.status === "complete" && !stageData.backend_generation) loadStageData("backend_generation");
     } else {
       const stage = TAB_STAGE_MAP[activeTab];
       if (stage) loadStageData(stage);
     }
-  }, [activeTab, loadStageData, pipeline]);
+  }, [
+    activeTab,
+    loadStageData,
+    pipeline.backend_generation?.status,
+    pipeline.frontend_generation?.status,
+    pipeline.json_transform?.status,
+    stageData.backend_generation,
+    stageData.frontend_generation,
+    stageData.json_transform,
+  ]);
 
   // Auto-load architecture when it completes
   useEffect(() => {
     if (pipeline.architecture?.status === "complete" && !stageData.architecture) {
       loadStageData("architecture");
     }
-  }, [pipeline.architecture?.status, loadStageData]);
+  }, [pipeline.architecture?.status, stageData.architecture, loadStageData]);
 
   return (
     <div className="h-full flex flex-col" data-testid="preview-panel">
       {/* Tabs */}
-      <div className="flex items-center border-b border-[var(--zap-border)] bg-white px-4 shrink-0">
-        {TABS.map(({ id, label, icon: Icon }) => (
-          <button
-            key={id}
-            data-testid={`preview-tab-${id}`}
-            onClick={() => setActiveTab(id)}
-            className={`flex items-center gap-1.5 px-3 py-2.5 text-sm transition-all
-              ${activeTab === id ? "tab-active" : "tab-inactive"}`}
-          >
-            <Icon className="w-3.5 h-3.5" />
-            {label}
-          </button>
-        ))}
+      <div className="flex items-center justify-between gap-3 border-b border-[var(--zap-border)] bg-white px-4 shrink-0">
+        <div className="flex items-center overflow-x-auto">
+          {TABS.map(({ id, label, icon: Icon }) => (
+            <button
+              key={id}
+              data-testid={`preview-tab-${id}`}
+              onClick={() => setActiveTab(id)}
+              className={`flex items-center gap-1.5 px-3 py-2.5 text-sm transition-all whitespace-nowrap
+                ${activeTab === id ? "tab-active" : "tab-inactive"}`}
+            >
+              <Icon className="w-3.5 h-3.5" />
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {activeTab === "code" && (
+          <div className="shrink-0 py-2">
+            <CodeDownloadButton
+              projectName={project?.name}
+              masterJson={masterJson}
+              implementationMarkdown={implementationMarkdown}
+              frontendCode={frontendCode}
+              backendCode={backendCode}
+              prominent
+            />
+          </div>
+        )}
       </div>
 
       {/* Content */}
@@ -101,9 +464,20 @@ export default function PreviewPanel({ project }) {
           {activeTab === "modules" && <ModulesTab architecture={architecture} />}
           {activeTab === "database" && <DatabaseTab architecture={architecture} />}
           {activeTab === "api" && <ApiTab architecture={architecture} />}
-          {activeTab === "code" && <CodeTab projectName={project?.name} frontendCode={frontendCode} backendCode={backendCode} />}
+          {activeTab === "code" && (
+            <CodeTab
+              projectName={project?.name}
+              masterJson={masterJson}
+              implementationMarkdown={implementationMarkdown}
+              frontendCode={frontendCode}
+              backendCode={backendCode}
+              pipeline={pipeline}
+              loadingStage={loadingStage}
+            />
+          )}
           {activeTab === "review" && <ReviewTab review={review} />}
           {activeTab === "json" && <JsonTab masterJson={masterJson} />}
+          {activeTab === "markdown" && <MarkdownTab projectName={project?.name} implementationMarkdown={implementationMarkdown} />}
         </div>
       </ScrollArea>
     </div>
@@ -386,55 +760,35 @@ function ApiTab({ architecture }) {
 }
 
 /* --- CODE --- */
-function CodeTab({ projectName, frontendCode, backendCode }) {
+function CodeTab({ projectName, masterJson, implementationMarkdown, frontendCode, backendCode, pipeline, loadingStage }) {
   const [codeType, setCodeType] = useState("frontend");
-  const [downloadedBundle, setDownloadedBundle] = useState(false);
   const code = codeType === "frontend" ? frontendCode : backendCode;
   const frontendFiles = frontendCode?.files || [];
   const backendFiles = backendCode?.files || [];
-  const combinedFiles = [
-    ...frontendFiles.map(file => ({ ...file, path: `frontend/${file.path}` })),
-    ...backendFiles.map(file => ({ ...file, path: `backend/${file.path}` })),
-  ];
-  const hasCombinedBundle = frontendFiles.length > 0 && backendFiles.length > 0;
+  const specFiles = [
+    masterJson
+      ? { path: "spec/erp-blueprint.json", language: "json", content: JSON.stringify(masterJson, null, 2) }
+      : null,
+    implementationMarkdown
+      ? { path: "spec/erp-build-guide.md", language: "markdown", content: implementationMarkdown }
+      : null,
+  ].filter(Boolean);
+  const activeCodeFiles = code?.files || [];
+  const viewerFiles = [...specFiles, ...activeCodeFiles];
+  const isCodeLoading =
+    ["json_transform", "frontend_generation", "backend_generation"].includes(loadingStage) ||
+    (pipeline?.frontend_generation?.status === "complete" && !frontendFiles.length) ||
+    (pipeline?.backend_generation?.status === "complete" && !backendFiles.length);
 
-  function archiveBaseName() {
-    return String(projectName || "ai-erp-builder")
-      .trim()
-      .replace(/[<>:"/\\|?*\x00-\x1f]+/g, "-")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "")
-      .toLowerCase();
-  }
-
-  function markDownloaded() {
-    setDownloadedBundle(true);
-    window.setTimeout(() => setDownloadedBundle(false), 2000);
-  }
-
-  function handleDownload() {
-    if (!hasCombinedBundle) {
-      toast.error("Both frontend and backend files need to be ready before downloading the full ZIP.");
-      return;
+  useEffect(() => {
+    if (codeType === "frontend" && !frontendFiles.length && backendFiles.length) {
+      setCodeType("backend");
     }
-
-    try {
-      const baseName = archiveBaseName() || "ai-erp-builder";
-      downloadFilesAsZip(combinedFiles, {
-        archiveName: `${baseName}-full-codebase`,
-        rootFolder: baseName,
-      });
-      markDownloaded();
-      toast.success("Frontend and backend code downloaded in one ZIP.");
-    } catch (error) {
-      toast.error("Couldn't download the full code ZIP right now.");
+    if (codeType === "backend" && !backendFiles.length && frontendFiles.length) {
+      setCodeType("frontend");
     }
-  }
+  }, [backendFiles.length, codeType, frontendFiles.length]);
 
-  if (!code?.files?.length) {
-    return <EmptyState icon={Code2} title="No Code Generated Yet" description="Code will be generated after the architecture phase completes." />;
-  }
   return (
     <div className="animate-fade-in-up" data-testid="code-content">
       <div className="flex items-center justify-between gap-3 mb-4 flex-wrap">
@@ -449,6 +803,7 @@ function CodeTab({ projectName, frontendCode, backendCode }) {
                   ? "border-[var(--zap-accent)] bg-[var(--zap-accent)]/5 text-[var(--zap-accent)] font-medium"
                   : "border-[var(--zap-border)] text-[var(--zap-text-muted)] hover:border-black/20"
               }`}
+              disabled={t === "frontend" ? !frontendFiles.length : !backendFiles.length}
             >
               {t}
             </button>
@@ -456,22 +811,28 @@ function CodeTab({ projectName, frontendCode, backendCode }) {
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
-          <button
-            data-testid="download-code-zip-btn"
-            onClick={handleDownload}
-            disabled={!hasCombinedBundle}
-            className={`flex items-center gap-1.5 px-3 py-1.5 text-sm border rounded-sm transition-all ${
-              hasCombinedBundle
-                ? "border-[var(--zap-border)] text-[var(--zap-text-heading)] hover:border-[var(--zap-accent)] hover:text-[var(--zap-accent)]"
-                : "border-[var(--zap-border)] text-[var(--zap-text-muted)] opacity-50 cursor-not-allowed"
-            }`}
-          >
-            {downloadedBundle ? <CheckCircle2 className="w-3.5 h-3.5 text-[var(--zap-success)]" /> : <Download className="w-3.5 h-3.5" />}
-            {downloadedBundle ? "Full code downloaded" : "Download full code ZIP"}
-          </button>
+          <CodeDownloadButton
+            projectName={projectName}
+            masterJson={masterJson}
+            implementationMarkdown={implementationMarkdown}
+            frontendCode={frontendCode}
+            backendCode={backendCode}
+          />
         </div>
       </div>
-      <CodeViewer files={code.files} />
+      {!viewerFiles.length ? (
+        <EmptyState
+          icon={Code2}
+          title={isCodeLoading ? "Loading Generated Code" : "No Code Generated Yet"}
+          description={
+            isCodeLoading
+              ? "Fetching the frontend and backend files for this project. The download button will activate automatically once both bundles are ready."
+              : "Code will be generated after the architecture phase completes."
+          }
+        />
+      ) : (
+        <CodeViewer files={viewerFiles} />
+      )}
     </div>
   );
 }
@@ -596,6 +957,81 @@ function JsonTab({ masterJson }) {
       </div>
       <div className="code-block max-h-[calc(100vh-200px)] overflow-auto">
         <pre className="text-xs leading-relaxed">{JSON.stringify(masterJson, null, 2)}</pre>
+      </div>
+    </div>
+  );
+}
+
+function MarkdownTab({ projectName, implementationMarkdown }) {
+  const [copied, setCopied] = useState(false);
+  const [downloaded, setDownloaded] = useState(false);
+
+  function fileName() {
+    const baseName = String(projectName || "ai-erp-builder")
+      .trim()
+      .replace(/[<>:"/\\|?*\x00-\x1f]+/g, "-")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "")
+      .toLowerCase();
+    return `${baseName || "ai-erp-builder"}-build-guide.md`;
+  }
+
+  async function handleCopyMarkdown() {
+    const success = await copyText(implementationMarkdown);
+    if (!success) {
+      toast.error("Couldn't copy the Markdown file right now.");
+      return;
+    }
+
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 2000);
+    toast.success("Markdown build guide copied.");
+  }
+
+  function handleDownloadMarkdown() {
+    try {
+      downloadTextFile(implementationMarkdown, {
+        fileName: fileName(),
+        mimeType: "text/markdown;charset=utf-8",
+      });
+      setDownloaded(true);
+      window.setTimeout(() => setDownloaded(false), 2000);
+      toast.success("Markdown build guide downloaded.");
+    } catch {
+      toast.error("Couldn't download the Markdown file right now.");
+    }
+  }
+
+  if (!implementationMarkdown) {
+    return <EmptyState icon={FileText} title="No MD File Yet" description="The Markdown build guide will appear after the JSON blueprint is generated." />;
+  }
+
+  return (
+    <div className="animate-fade-in-up" data-testid="markdown-content">
+      <div className="flex items-center justify-between gap-3 mb-4 flex-wrap">
+        <h2 className="text-xl font-bold tracking-tight" style={{ fontFamily: 'var(--font-heading)' }}>ERP Build Guide (.md)</h2>
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            data-testid="download-markdown-btn"
+            onClick={handleDownloadMarkdown}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm border border-[var(--zap-border)] rounded-sm text-[var(--zap-text-heading)] hover:border-[var(--zap-accent)] hover:text-[var(--zap-accent)] transition-all"
+          >
+            {downloaded ? <CheckCircle2 className="w-3.5 h-3.5 text-[var(--zap-success)]" /> : <Download className="w-3.5 h-3.5" />}
+            {downloaded ? "Downloaded MD" : "Download MD"}
+          </button>
+          <button
+            data-testid="copy-markdown-btn"
+            onClick={handleCopyMarkdown}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm border border-[var(--zap-border)] rounded-sm text-[var(--zap-text-heading)] hover:border-[var(--zap-accent)] hover:text-[var(--zap-accent)] transition-all"
+          >
+            {copied ? <CheckCircle2 className="w-3.5 h-3.5 text-[var(--zap-success)]" /> : <Copy className="w-3.5 h-3.5" />}
+            {copied ? "Copied MD" : "Copy MD"}
+          </button>
+        </div>
+      </div>
+      <div className="code-block max-h-[calc(100vh-200px)] overflow-auto">
+        <pre className="text-xs leading-relaxed whitespace-pre-wrap">{implementationMarkdown}</pre>
       </div>
     </div>
   );

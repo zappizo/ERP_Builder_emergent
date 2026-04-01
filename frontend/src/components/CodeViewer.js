@@ -1,18 +1,24 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { FileCode, FolderOpen, Copy, CheckCircle2 } from "lucide-react";
 import { Light as SyntaxHighlighter } from "react-syntax-highlighter";
 import js from "react-syntax-highlighter/dist/esm/languages/hljs/javascript";
+import jsonLang from "react-syntax-highlighter/dist/esm/languages/hljs/json";
+import markdown from "react-syntax-highlighter/dist/esm/languages/hljs/markdown";
 import python from "react-syntax-highlighter/dist/esm/languages/hljs/python";
 import { atomOneDark } from "react-syntax-highlighter/dist/esm/styles/hljs";
 
 SyntaxHighlighter.registerLanguage("javascript", js);
 SyntaxHighlighter.registerLanguage("jsx", js);
+SyntaxHighlighter.registerLanguage("json", jsonLang);
+SyntaxHighlighter.registerLanguage("markdown", markdown);
 SyntaxHighlighter.registerLanguage("python", python);
 
 function getLanguage(path) {
   if (!path) return "javascript";
   if (path.endsWith(".py")) return "python";
+  if (path.endsWith(".json")) return "json";
+  if (path.endsWith(".md")) return "markdown";
   if (path.endsWith(".jsx") || path.endsWith(".tsx") || path.endsWith(".js") || path.endsWith(".ts")) return "javascript";
   return "javascript";
 }
@@ -21,8 +27,16 @@ export default function CodeViewer({ files }) {
   const [selected, setSelected] = useState(0);
   const [copied, setCopied] = useState(false);
 
+  useEffect(() => {
+    if (files?.length && selected >= files.length) {
+      setSelected(0);
+    }
+  }, [files, selected]);
+
   if (!files?.length) return null;
-  const file = files[selected];
+
+  const file = files[selected] || files[0];
+  if (!file) return null;
 
   function handleCopy() {
     navigator.clipboard.writeText(file.content || "");

@@ -25,6 +25,8 @@ OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "").strip()
 OPENROUTER_MODELS = os.environ.get("OPENROUTER_MODELS", "").strip()
 OPENROUTER_SITE_URL = os.environ.get("OPENROUTER_SITE_URL", "http://127.0.0.1:3001").strip() or "http://127.0.0.1:3001"
 OPENROUTER_APP_NAME = os.environ.get("OPENROUTER_APP_NAME", "AI ERP Builder").strip() or "AI ERP Builder"
+OPENROUTER_TIMEOUT = max(5, int((os.environ.get("OPENROUTER_TIMEOUT", "90") or "90").strip()))
+MARKDOWN_BLUEPRINT_TIMEOUT = min(OPENROUTER_TIMEOUT, 12)
 
 
 def _dedupe_models(models):
@@ -775,6 +777,50 @@ def _extract_error_message(data, status_code):
     return f"HTTP {status_code}"
 
 
+def _extract_choice_text(choice):
+    if not isinstance(choice, dict):
+        return None
+
+    message = choice.get("message") or {}
+    content = message.get("content")
+
+    if isinstance(content, str) and content.strip():
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        joined = "".join(parts).strip()
+        if joined:
+            return joined
+
+    text = choice.get("text")
+    if isinstance(text, str) and text.strip():
+        return text
+
+    reasoning = message.get("reasoning")
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning
+
+    reasoning_details = message.get("reasoning_details") or choice.get("reasoning_details") or []
+    if isinstance(reasoning_details, list):
+        parts = []
+        for item in reasoning_details:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        joined = "".join(parts).strip()
+        if joined:
+            return joined
+
+    return None
+
+
 def _should_disable_remote(message):
     lowered = (message or "").lower()
     return any(
@@ -815,14 +861,14 @@ def _call_llm_sync(messages, temperature=0.7, max_tokens=4000):
 
         for attempt in range(2):
             try:
-                resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=90)
+                resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=OPENROUTER_TIMEOUT)
                 try:
                     data = resp.json()
                 except ValueError:
                     data = {}
 
                 if resp.ok and data.get("choices"):
-                    content = data["choices"][0]["message"].get("content")
+                    content = _extract_choice_text(data["choices"][0])
                     if content:
                         return content
                     errors.append(f"{model}: empty response")
@@ -855,8 +901,11 @@ def _call_llm_sync(messages, temperature=0.7, max_tokens=4000):
     raise RuntimeError("; ".join(errors) if errors else "All models failed")
 
 
-async def call_llm(messages, temperature=0.7, max_tokens=4000):
-    return await asyncio.to_thread(_call_llm_sync, messages, temperature, max_tokens)
+async def call_llm(messages, temperature=0.7, max_tokens=4000, timeout=None):
+    task = asyncio.to_thread(_call_llm_sync, messages, temperature, max_tokens)
+    if timeout:
+        return await asyncio.wait_for(task, timeout=timeout)
+    return await task
 
 
 def _extract_json(text):
@@ -1971,7 +2020,243 @@ Validate all cross-references. Output ONLY JSON."""
         return _fallback_master_json(architecture)
 
 
-async def frontend_generator(master_json):
+def _fallback_markdown_blueprint(project_name, conversation_transcript, requirements, architecture, master_json):
+    system_name = project_name or master_json.get("system", {}).get("name", "AI ERP Builder")
+    system_description = (
+        master_json.get("system", {}).get("description")
+        or architecture.get("description")
+        or requirements.get("business_type", "Create an ERP implementation from the captured requirements.")
+    )
+    modules = master_json.get("modules", [])
+    tables = master_json.get("database", {}).get("tables", [])
+    roles = master_json.get("auth", {}).get("roles", [])
+    permissions = master_json.get("auth", {}).get("permissions", {})
+
+    lines = [
+        f"# {system_name} Build Guide",
+        "",
+        "## Executive Summary",
+        (
+            f"{system_name} is an ERP application that should be rebuilt from the combination of the structured JSON blueprint "
+            f"and this Markdown guide. The implementation should preserve the module model, workflow behavior, data contracts, "
+            f"access controls, and operational expectations captured during discovery."
+        ),
+        "",
+        "## Business Context",
+        f"- Business Type: {requirements.get('business_type', 'Not specified')}",
+        f"- Industry: {requirements.get('industry', 'Not specified')}",
+        f"- Scale: {requirements.get('scale', 'Not specified')}",
+        f"- Target Outcome: {system_description}",
+        "",
+        "## Conversation Summary",
+        conversation_transcript or "No project conversation transcript was captured.",
+        "",
+        "## Module Breakdown",
+    ]
+
+    if not modules:
+        lines.append("- No modules were provided in the master blueprint. Use the architecture and requirements to define the first implementation slice.")
+
+    for module in modules:
+        module_name = module.get("name", "Module")
+        lines.append(f"### {module_name}")
+        lines.append(f"- Module ID: {module.get('id', 'n/a')}")
+        if module.get("description"):
+            lines.append(f"- Purpose: {module['description']}")
+        for entity in module.get("entities", [])[:6]:
+            entity_name = entity.get("name") or entity.get("id") or "Entity"
+            lines.append(f"- Entity: {entity_name}")
+        for workflow in module.get("workflows", [])[:4]:
+            workflow_name = workflow.get("name") or workflow.get("id") or "Workflow"
+            lines.append(f"- Workflow: {workflow_name}")
+        for endpoint in module.get("endpoints", [])[:6]:
+            method = endpoint.get("method", "GET")
+            path = endpoint.get("path", "/")
+            lines.append(f"- API: {method} {path}")
+        lines.append("")
+
+    lines.extend(
+        [
+            "## Entity and Data Model Notes",
+            f"- Database Provider: {master_json.get('database', {}).get('provider', 'postgresql')}",
+            "- Treat the JSON blueprint as the authoritative source for entity names, fields, relationships, and validation defaults.",
+        ]
+    )
+    if tables:
+        for table in tables[:12]:
+            lines.append(f"- Table: {table.get('name', 'table')} with {len(table.get('fields', []))} fields")
+    else:
+        lines.append("- No tables were captured in the blueprint. Derive schema directly from the module entities and workflows.")
+
+    lines.extend(
+        [
+            "",
+            "## Workflow Notes",
+        ]
+    )
+    workflow_lines = []
+    for module in modules:
+        for workflow in module.get("workflows", [])[:4]:
+            workflow_name = workflow.get("name") or workflow.get("id") or "Workflow"
+            steps = workflow.get("steps") or []
+            step_text = " -> ".join(steps) if steps else "Define steps from the conversation summary and entity lifecycle."
+            workflow_lines.append(f"- {module.get('name', 'Module')}: {workflow_name} | Steps: {step_text}")
+    lines.extend(workflow_lines or ["- No explicit workflow objects were captured. Reconstruct flows from the requirement transcript and module responsibilities."])
+
+    lines.extend(
+        [
+            "",
+            "## Backend Implementation Guidance",
+            "- Generate the backend around the JSON blueprint entities, workflow services, and API contracts.",
+            "- Keep authentication, authorization, audit logging, validation, and error handling centralized.",
+            "- Implement SQLAlchemy models, Pydantic schemas, service-layer orchestration, and REST endpoints module by module.",
+            "- Preserve compatibility between the stored master JSON, generated code artifacts, and runtime API responses.",
+            "",
+            "## Frontend Implementation Guidance",
+            "- Build the frontend around dashboard, list, form, detail, and reporting views required by the blueprint.",
+            "- Use the module list and workflow definitions to drive navigation, forms, filters, and action states.",
+            "- Keep the UI responsive, production-oriented, and aligned with the module terminology in the conversation summary.",
+            "- Use this Markdown guide and the JSON file together when generating the code viewer output and downloadable bundle.",
+            "",
+            "## API Expectations",
+            "- Expose module CRUD routes, workflow action routes, and authentication/session endpoints that align with the blueprint.",
+            "- Return predictable JSON payloads that match the schema names used in the generated frontend.",
+            "- Provide health, configuration, and deployment-related endpoints where the platform contract requires them.",
+            "",
+            "## Permissions and RBAC",
+        ]
+    )
+    if roles:
+        for role in roles:
+            lines.append(f"- Role: {role}")
+    else:
+        lines.append("- Define at least admin and operational user roles from the requirements.")
+    if permissions:
+        lines.append("- Permission Matrix:")
+        for role, grants in permissions.items():
+            lines.append(f"- {role}: {', '.join(grants) if isinstance(grants, list) and grants else 'custom grants required'}")
+    else:
+        lines.append("- Configure permissions by module, CRUD action, workflow action, and reporting access.")
+
+    lines.extend(
+        [
+            "",
+            "## Automation Opportunities",
+            "- Add workflow triggers for status changes, approvals, reminders, and assignment updates.",
+            "- Use notifications and background jobs where the business flow needs asynchronous follow-up.",
+            "- Capture audit logs for critical data changes and operational lifecycle transitions.",
+            "",
+            "## Deployment Notes",
+            "- Package the backend with environment-based configuration and a production-ready database connection.",
+            "- Keep frontend and backend configuration consistent for API base URLs, authentication, and runtime secrets.",
+            "- Validate seed data, migrations, and environment examples before deployment.",
+            "",
+            "## Build Checklist",
+            "- [ ] Finalize entities, fields, and relationships from the blueprint.",
+            "- [ ] Implement backend models, schemas, services, and routes.",
+            "- [ ] Implement frontend dashboards, forms, tables, and workflow actions.",
+            "- [ ] Connect auth, RBAC, notifications, and audit logging.",
+            "- [ ] Validate API contracts against the JSON blueprint.",
+            "- [ ] Package the final frontend and backend together with the blueprint JSON and this Markdown guide.",
+        ]
+    )
+
+    return "\n".join(lines).strip()
+
+
+def _is_valid_markdown_blueprint(text):
+    if not isinstance(text, str):
+        return False
+
+    normalized = text.strip()
+    if not normalized:
+        return False
+
+    heading_count = sum(1 for line in normalized.splitlines() if line.lstrip().startswith("#"))
+    required_markers = [
+        "executive summary",
+        "business context",
+        "backend",
+        "frontend",
+        "api",
+        "checklist",
+    ]
+    lowered = normalized.lower()
+
+    if not normalized.startswith("#"):
+        return False
+    if heading_count < 4:
+        return False
+    if any(marker not in lowered for marker in required_markers):
+        return False
+
+    forbidden_markers = [
+        "we need to produce",
+        "we should produce",
+        "the user specified",
+        "we have the conversation transcript",
+        "let's structure",
+    ]
+    return not any(marker in lowered for marker in forbidden_markers)
+
+
+def is_valid_markdown_blueprint(text):
+    return _is_valid_markdown_blueprint(text)
+
+
+async def markdown_blueprint_generator(project_name, conversation_transcript, requirements, architecture, master_json):
+    system_prompt = dedent(
+        """
+        You are a senior ERP solution writer. Convert the complete project conversation summary and JSON blueprint
+        into a self-sufficient Markdown implementation guide that can be used to rebuild the ERP system independently.
+
+        Requirements:
+        - Output ONLY Markdown.
+        - Write a serious implementation document, not a marketing summary.
+        - Include: executive summary, business context, module breakdown, entity/data model notes, workflow notes,
+          backend implementation guidance, frontend implementation guidance, API expectations, permissions/RBAC,
+          automation opportunities, deployment notes, and a build checklist.
+        - Treat the chat transcript as the human requirement narrative and the JSON blueprint as the canonical technical contract.
+        - The result should be useful as an indigenous build guide for recreating the ERP system from scratch.
+        """
+    ).strip()
+
+    transcript = conversation_transcript.strip() or "No conversation transcript was captured."
+    blueprint = json.dumps(master_json, indent=2)
+    if len(blueprint) > 14000:
+        blueprint = blueprint[:14000] + "\n... (truncated)"
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": (
+                f"Project Name:\n{project_name}\n\n"
+                f"Conversation Transcript:\n{transcript}\n\n"
+                f"Requirements JSON:\n{json.dumps(requirements, indent=2)}\n\n"
+                f"Architecture JSON:\n{json.dumps(architecture, indent=2)}\n\n"
+                f"Master ERP JSON:\n{blueprint}"
+            ),
+        },
+    ]
+    try:
+        result = await call_llm(
+            messages,
+            temperature=0.2,
+            max_tokens=3500,
+            timeout=MARKDOWN_BLUEPRINT_TIMEOUT,
+        )
+        if isinstance(result, str):
+            normalized = result.strip()
+            if _is_valid_markdown_blueprint(normalized):
+                return normalized
+        raise ValueError("Markdown generator returned invalid Markdown content")
+    except Exception as exc:
+        logger.warning("Markdown blueprint generator falling back to local generation: %s", exc)
+        return _fallback_markdown_blueprint(project_name, conversation_transcript, requirements, architecture, master_json)
+
+
+async def frontend_generator(master_json, implementation_markdown=None):
     system_prompt = """You are a Frontend Code Generator. Generate React + Tailwind components from the ERP JSON schema.
 
 Respond with ONLY valid JSON:
@@ -1995,7 +2280,13 @@ Output ONLY JSON."""
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Schema:\n{json.dumps(master_json, indent=2)}"},
+        {
+            "role": "user",
+            "content": (
+                f"Schema:\n{json.dumps(master_json, indent=2)}\n\n"
+                f"Implementation Markdown:\n{(implementation_markdown or '').strip()[:8000]}"
+            ),
+        },
     ]
     try:
         result = await call_llm(messages, temperature=0.3, max_tokens=4000)
@@ -2005,7 +2296,7 @@ Output ONLY JSON."""
         return _frontend_file_bundle(master_json)
 
 
-async def backend_generator(master_json):
+async def backend_generator(master_json, implementation_markdown=None):
     system_prompt = """You are a Backend Code Generator. Generate FastAPI + SQLAlchemy code from the ERP JSON schema.
 
 Respond with ONLY valid JSON:
@@ -2031,7 +2322,13 @@ Include proper error handling. Output ONLY JSON."""
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Schema:\n{json.dumps(master_json, indent=2)}"},
+        {
+            "role": "user",
+            "content": (
+                f"Schema:\n{json.dumps(master_json, indent=2)}\n\n"
+                f"Implementation Markdown:\n{(implementation_markdown or '').strip()[:8000]}"
+            ),
+        },
     ]
     try:
         result = await call_llm(messages, temperature=0.3, max_tokens=4000)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -12,7 +13,9 @@ from agents import (
     code_reviewer,
     erp_architect,
     frontend_generator,
+    is_valid_markdown_blueprint,
     json_transformer,
+    markdown_blueprint_generator,
     requirement_analyzer,
     requirement_gatherer,
 )
@@ -222,6 +225,22 @@ def build_conversation_history(db: Session, project_id: str) -> list[dict[str, s
         .all()
     )
     return [{"role": item.role, "content": item.content} for item in messages]
+
+
+def build_chat_transcript(db: Session, project_id: str) -> str:
+    history = build_conversation_history(db, project_id)
+    if not history:
+        return ""
+
+    labels = {"user": "User", "assistant": "Assistant", "system": "System"}
+    lines = []
+    for item in history:
+        role = labels.get(item.get("role", "").lower(), item.get("role", "Message").title() or "Message")
+        content = (item.get("content") or "").strip()
+        if not content:
+            continue
+        lines.append(f"### {role}\n{content}")
+    return "\n\n".join(lines)
 
 
 def _analysis_seed(project: Project, message: str) -> str:
@@ -551,6 +570,18 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
         db.commit()
 
         master_json = _validate_master_json(await json_transformer(architecture))
+        markdown_spec = await markdown_blueprint_generator(
+            project.name,
+            build_chat_transcript(db, project.id),
+            requirements,
+            architecture,
+            master_json,
+        )
+        documentation = dict(master_json.get("documentation") or {})
+        documentation["erp_build_markdown"] = markdown_spec
+        documentation["source_summary"] = requirement_session.summary or architecture.get("description", "")
+        documentation["chat_transcript_markdown"] = build_chat_transcript(db, project.id)
+        master_json["documentation"] = documentation
         update_stage(project, "json_transform", "complete", master_json)
         add_project_message(db, project.id, "assistant", "Blueprint normalized into the master ERP JSON contract.", agent="json_transformer")
         db.commit()
@@ -560,8 +591,30 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
         update_stage(project, "frontend_generation", "running")
         db.commit()
 
-        frontend_bundle = _validate_bundle(await frontend_generator(master_json))
+        frontend_bundle = _validate_bundle(await frontend_generator(master_json, markdown_spec))
         update_stage(project, "frontend_generation", "complete", frontend_bundle)
+        db.add(
+            GeneratedArtifact(
+                generation_job_id=job.id,
+                project_id=project.id,
+                artifact_type="spec",
+                file_path="spec/erp-build-guide.md",
+                language="markdown",
+                content_text=markdown_spec,
+                metadata_json={"source": "markdown_blueprint_generator"},
+            )
+        )
+        db.add(
+            GeneratedArtifact(
+                generation_job_id=job.id,
+                project_id=project.id,
+                artifact_type="spec",
+                file_path="spec/erp-blueprint.json",
+                language="json",
+                content_text=json.dumps(master_json, indent=2),
+                metadata_json={"source": "json_transformer"},
+            )
+        )
         for generated_file in frontend_bundle.get("files", []):
             db.add(
                 GeneratedArtifact(
@@ -582,7 +635,7 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
         update_stage(project, "backend_generation", "running")
         db.commit()
 
-        backend_bundle = _validate_bundle(await backend_generator(master_json))
+        backend_bundle = _validate_bundle(await backend_generator(master_json, markdown_spec))
         update_stage(project, "backend_generation", "complete", backend_bundle)
         for generated_file in backend_bundle.get("files", []):
             db.add(
@@ -616,6 +669,7 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
             snapshot_json={
                 "architecture": architecture,
                 "master_json": master_json,
+                "build_markdown": markdown_spec,
                 "review": review,
             },
         )
@@ -631,6 +685,7 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
         job.result_summary_json = {
             "blueprint_version_id": blueprint.id,
             "project_version_id": project_version.id,
+            "markdown_spec_available": bool(markdown_spec),
             "frontend_file_count": len(frontend_bundle.get("files", [])),
             "backend_file_count": len(backend_bundle.get("files", [])),
             "review_score": review.get("overall_score"),
@@ -768,6 +823,56 @@ def get_pipeline_stage(project: Project, stage: str) -> PipelineStageRead:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid stage")
     state = ensure_pipeline_state(project)
     return PipelineStageRead.model_validate(state.get(stage, {}))
+
+
+async def ensure_markdown_documentation(db: Session, project: Project) -> dict[str, Any] | None:
+    state = ensure_pipeline_state(project)
+    json_stage = dict(state.get("json_transform") or {})
+    if json_stage.get("status") != "complete":
+        return json_stage.get("output")
+
+    output = dict(json_stage.get("output") or {})
+    if not output:
+        return output
+
+    documentation = dict(output.get("documentation") or {})
+    existing_markdown = documentation.get("erp_build_markdown")
+    if existing_markdown and is_valid_markdown_blueprint(existing_markdown):
+        return output
+
+    requirement_session = get_requirement_session(db, project)
+    architecture_output = dict((state.get("architecture") or {}).get("output") or {})
+    conversation_transcript = build_chat_transcript(db, project.id)
+    markdown_spec = await markdown_blueprint_generator(
+        project.name,
+        conversation_transcript,
+        requirement_session.normalized_requirements or {},
+        architecture_output,
+        output,
+    )
+
+    documentation["erp_build_markdown"] = markdown_spec
+    documentation["source_summary"] = requirement_session.summary or architecture_output.get("description", "")
+    documentation["chat_transcript_markdown"] = conversation_transcript
+    output["documentation"] = documentation
+
+    json_stage["output"] = output
+    json_stage["updated_at"] = now_iso()
+    state["json_transform"] = json_stage
+    project.pipeline_state = state
+    project.updated_at = utc_now()
+
+    if project.current_project_version_id:
+        project_version = db.query(ProjectVersion).filter(ProjectVersion.id == project.current_project_version_id).first()
+        if project_version:
+            snapshot = dict(project_version.snapshot_json or {})
+            snapshot["master_json"] = output
+            snapshot["build_markdown"] = markdown_spec
+            project_version.snapshot_json = snapshot
+
+    db.commit()
+    db.refresh(project)
+    return output
 
 
 def soft_delete_project(db: Session, project: Project, user: User) -> None:

@@ -22,6 +22,7 @@ from ..schemas import (
 )
 from ..services import (
     create_project,
+    ensure_markdown_documentation,
     get_pipeline_stage,
     get_project_or_404,
     get_project_requirement_session,
@@ -117,13 +118,16 @@ async def chat_endpoint(
 
 
 @router.get("/{project_id}/pipeline/{stage}", response_model=PipelineStageRead)
-def get_pipeline_stage_endpoint(
+async def get_pipeline_stage_endpoint(
     project_id: str,
     stage: str,
     db: Session = Depends(get_db),
     user: User = Depends(ensure_active_user),
 ) -> PipelineStageRead:
     project = get_project_or_404(db, project_id, user)
+    if stage == "json_transform":
+        await ensure_markdown_documentation(db, project)
+        db.refresh(project)
     return get_pipeline_stage(project, stage)
 
 
