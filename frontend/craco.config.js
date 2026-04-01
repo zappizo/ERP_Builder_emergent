@@ -61,6 +61,15 @@ let webpackConfig = {
 };
 
 webpackConfig.devServer = (devServerConfig) => {
+  devServerConfig.proxy = {
+    ...devServerConfig.proxy,
+    "/api": {
+      target: process.env.REACT_APP_BACKEND_URL || "http://127.0.0.1:8001",
+      changeOrigin: true,
+      secure: false,
+    },
+  };
+
   // Add health check endpoints if enabled
   if (config.enableHealthCheck && setupHealthEndpoints && healthPluginInstance) {
     const originalSetupMiddlewares = devServerConfig.setupMiddlewares;

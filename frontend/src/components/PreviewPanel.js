@@ -3,10 +3,12 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import CodeViewer from "@/components/CodeViewer";
 import { getPipelineStage } from "@/lib/api";
+import { copyText, downloadFilesAsZip } from "@/lib/export";
+import { toast } from "sonner";
 import {
   LayoutDashboard, Database, Globe, Code2, ShieldCheck, FileJson, Package,
   Users, ShoppingCart, Briefcase, Settings, BarChart3, Layers, CheckCircle2,
-  AlertTriangle, XCircle, Info, Loader2
+  AlertTriangle, XCircle, Info, Download, Copy
 } from "lucide-react";
 
 const ICON_MAP = {
@@ -99,7 +101,7 @@ export default function PreviewPanel({ project }) {
           {activeTab === "modules" && <ModulesTab architecture={architecture} />}
           {activeTab === "database" && <DatabaseTab architecture={architecture} />}
           {activeTab === "api" && <ApiTab architecture={architecture} />}
-          {activeTab === "code" && <CodeTab frontendCode={frontendCode} backendCode={backendCode} />}
+          {activeTab === "code" && <CodeTab projectName={project?.name} frontendCode={frontendCode} backendCode={backendCode} />}
           {activeTab === "review" && <ReviewTab review={review} />}
           {activeTab === "json" && <JsonTab masterJson={masterJson} />}
         </div>
@@ -384,29 +386,90 @@ function ApiTab({ architecture }) {
 }
 
 /* --- CODE --- */
-function CodeTab({ frontendCode, backendCode }) {
+function CodeTab({ projectName, frontendCode, backendCode }) {
   const [codeType, setCodeType] = useState("frontend");
+  const [downloadedBundle, setDownloadedBundle] = useState(false);
   const code = codeType === "frontend" ? frontendCode : backendCode;
+  const frontendFiles = frontendCode?.files || [];
+  const backendFiles = backendCode?.files || [];
+  const combinedFiles = [
+    ...frontendFiles.map(file => ({ ...file, path: `frontend/${file.path}` })),
+    ...backendFiles.map(file => ({ ...file, path: `backend/${file.path}` })),
+  ];
+  const hasCombinedBundle = frontendFiles.length > 0 && backendFiles.length > 0;
+
+  function archiveBaseName() {
+    return String(projectName || "ai-erp-builder")
+      .trim()
+      .replace(/[<>:"/\\|?*\x00-\x1f]+/g, "-")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "")
+      .toLowerCase();
+  }
+
+  function markDownloaded() {
+    setDownloadedBundle(true);
+    window.setTimeout(() => setDownloadedBundle(false), 2000);
+  }
+
+  function handleDownload() {
+    if (!hasCombinedBundle) {
+      toast.error("Both frontend and backend files need to be ready before downloading the full ZIP.");
+      return;
+    }
+
+    try {
+      const baseName = archiveBaseName() || "ai-erp-builder";
+      downloadFilesAsZip(combinedFiles, {
+        archiveName: `${baseName}-full-codebase`,
+        rootFolder: baseName,
+      });
+      markDownloaded();
+      toast.success("Frontend and backend code downloaded in one ZIP.");
+    } catch (error) {
+      toast.error("Couldn't download the full code ZIP right now.");
+    }
+  }
+
   if (!code?.files?.length) {
     return <EmptyState icon={Code2} title="No Code Generated Yet" description="Code will be generated after the architecture phase completes." />;
   }
   return (
     <div className="animate-fade-in-up" data-testid="code-content">
-      <div className="flex items-center gap-2 mb-4">
-        {["frontend", "backend"].map(t => (
+      <div className="flex items-center justify-between gap-3 mb-4 flex-wrap">
+        <div className="flex items-center gap-2">
+          {["frontend", "backend"].map(t => (
+            <button
+              key={t}
+              data-testid={`code-type-${t}`}
+              onClick={() => setCodeType(t)}
+              className={`px-3 py-1.5 text-sm border rounded-sm transition-all capitalize ${
+                t === codeType
+                  ? "border-[var(--zap-accent)] bg-[var(--zap-accent)]/5 text-[var(--zap-accent)] font-medium"
+                  : "border-[var(--zap-border)] text-[var(--zap-text-muted)] hover:border-black/20"
+              }`}
+            >
+              {t}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex items-center gap-2 flex-wrap">
           <button
-            key={t}
-            data-testid={`code-type-${t}`}
-            onClick={() => setCodeType(t)}
-            className={`px-3 py-1.5 text-sm border rounded-sm transition-all capitalize ${
-              t === codeType
-                ? "border-[var(--zap-accent)] bg-[var(--zap-accent)]/5 text-[var(--zap-accent)] font-medium"
-                : "border-[var(--zap-border)] text-[var(--zap-text-muted)] hover:border-black/20"
+            data-testid="download-code-zip-btn"
+            onClick={handleDownload}
+            disabled={!hasCombinedBundle}
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-sm border rounded-sm transition-all ${
+              hasCombinedBundle
+                ? "border-[var(--zap-border)] text-[var(--zap-text-heading)] hover:border-[var(--zap-accent)] hover:text-[var(--zap-accent)]"
+                : "border-[var(--zap-border)] text-[var(--zap-text-muted)] opacity-50 cursor-not-allowed"
             }`}
           >
-            {t}
+            {downloadedBundle ? <CheckCircle2 className="w-3.5 h-3.5 text-[var(--zap-success)]" /> : <Download className="w-3.5 h-3.5" />}
+            {downloadedBundle ? "Full code downloaded" : "Download full code ZIP"}
           </button>
-        ))}
+        </div>
       </div>
       <CodeViewer files={code.files} />
     </div>
@@ -501,12 +564,36 @@ function ReviewTab({ review }) {
 
 /* --- JSON --- */
 function JsonTab({ masterJson }) {
+  const [copied, setCopied] = useState(false);
+
+  async function handleCopyJson() {
+    const success = await copyText(JSON.stringify(masterJson, null, 2));
+    if (!success) {
+      toast.error("Couldn't copy the JSON right now.");
+      return;
+    }
+
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 2000);
+    toast.success("JSON copied to clipboard.");
+  }
+
   if (!masterJson) {
     return <EmptyState icon={FileJson} title="No Master JSON Yet" description="The JSON schema will be generated after architecture design." />;
   }
   return (
     <div className="animate-fade-in-up" data-testid="json-content">
-      <h2 className="text-xl font-bold tracking-tight mb-4" style={{ fontFamily: 'var(--font-heading)' }}>Master JSON Schema</h2>
+      <div className="flex items-center justify-between gap-3 mb-4 flex-wrap">
+        <h2 className="text-xl font-bold tracking-tight" style={{ fontFamily: 'var(--font-heading)' }}>Master JSON Schema</h2>
+        <button
+          data-testid="copy-json-btn"
+          onClick={handleCopyJson}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-sm border border-[var(--zap-border)] rounded-sm text-[var(--zap-text-heading)] hover:border-[var(--zap-accent)] hover:text-[var(--zap-accent)] transition-all"
+        >
+          {copied ? <CheckCircle2 className="w-3.5 h-3.5 text-[var(--zap-success)]" /> : <Copy className="w-3.5 h-3.5" />}
+          {copied ? "Copied JSON" : "Copy JSON"}
+        </button>
+      </div>
       <div className="code-block max-h-[calc(100vh-200px)] overflow-auto">
         <pre className="text-xs leading-relaxed">{JSON.stringify(masterJson, null, 2)}</pre>
       </div>
