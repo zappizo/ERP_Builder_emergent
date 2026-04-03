@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from inspect import signature
 from inspect import isawaitable
@@ -73,7 +74,13 @@ from .schemas import (
     RequirementSessionRead,
     RequirementsDocumentPayload,
 )
-from .template_loader import attach_erp_ui_template_metadata, load_erp_ui_template
+from .template_loader import (
+    attach_erp_ui_template_metadata,
+    list_erp_ui_templates,
+    load_erp_ui_template,
+    resolve_erp_ui_template_id,
+)
+from .template_frontend_bundle import build_template_driven_frontend_bundle
 
 
 logger = logging.getLogger(__name__)
@@ -110,6 +117,47 @@ def default_pipeline_state() -> dict[str, dict[str, Any]]:
         stage: {"status": "pending", "output": None, "updated_at": None}
         for stage in PIPELINE_STAGES
     }
+
+
+def get_project_template_id(project: Project | None) -> str:
+    metadata = dict((getattr(project, "metadata_json", {}) if project else {}) or {})
+    return resolve_erp_ui_template_id(metadata.get("selected_template_id"))
+
+
+def get_project_template_reference(project: Project | None, *, include_source_contents: bool = True) -> dict[str, Any]:
+    template_id = get_project_template_id(project)
+    if include_source_contents:
+        return load_erp_ui_template(template_id)
+    for template in list_erp_ui_templates():
+        if template.get("id") == template_id:
+            return template
+    templates = list_erp_ui_templates()
+    return templates[0] if templates else {}
+
+
+def list_available_project_templates() -> list[dict[str, Any]]:
+    templates = []
+    for template in list_erp_ui_templates():
+        templates.append(
+            {
+                "id": template.get("id"),
+                "name": template.get("name"),
+                "display_name": template.get("display_name"),
+                "reference_project": template.get("reference_project"),
+                "summary": template.get("summary") or "",
+                "relative_directory": template.get("relative_directory"),
+                "status": template.get("status", "unknown"),
+                "source_files": [
+                    {
+                        "relative_path": item.get("relative_path"),
+                        "language": item.get("language", "text"),
+                        "role": item.get("role"),
+                    }
+                    for item in (template.get("source_files") or [])
+                ],
+            }
+        )
+    return templates
 
 
 def ensure_pipeline_state(project: Project) -> dict[str, dict[str, Any]]:
@@ -151,17 +199,136 @@ def reset_generation_stages(project: Project, *, preserve_existing_outputs: bool
     project.pipeline_state = state
 
 
+def mark_stage_failure(project: Project, stage: str, error_message: str) -> None:
+    error_payload = {"error": error_message}
+    update_stage(project, stage, "failed", error_payload)
+    if stage not in {"frontend_generation", "backend_generation"}:
+        return
+
+    paired_stage = "backend_generation" if stage == "frontend_generation" else "frontend_generation"
+    paired_state = dict(ensure_pipeline_state(project).get(paired_stage) or {})
+    if paired_state.get("status") == "running":
+        update_stage(project, paired_stage, "failed", error_payload)
+
+
+def _should_preserve_last_working_build(project: Project, change_request: str | None) -> bool:
+    return bool(change_request and project.current_project_version_id)
+
+
+def _apply_generation_failure_state(
+    project: Project,
+    job: GenerationJob,
+    error_message: str,
+    *,
+    change_request: str | None = None,
+) -> dict[str, Any]:
+    preserved_last_build = _should_preserve_last_working_build(project, change_request)
+    if preserved_last_build:
+        project.status = "COMPLETE"
+        project.lifecycle_state = "generated"
+    else:
+        project.status = "ERROR"
+        project.lifecycle_state = "error"
+
+    job.status = "failed"
+    job.error_message = error_message
+    job.completed_at = utc_now()
+    mark_stage_failure(project, job.current_stage or "architecture", error_message)
+
+    return {
+        "preserved_last_build": preserved_last_build,
+        "message": (
+            "The requested changes could not be applied cleanly. The last working ERP version is still available; "
+            "review the job logs and retry with a refined change request."
+            if preserved_last_build
+            else "Generation failed. Please review the job logs and retry with a refined change request."
+        ),
+        "notification_title": "Revision failed, previous build preserved" if preserved_last_build else "Generation failed",
+        "notification_body": (
+            f"Project {project.name} kept the last working ERP version after a failed revision attempt."
+            if preserved_last_build
+            else f"Project {project.name} encountered an error during generation."
+        ),
+        "audit_details": {
+            "error": error_message,
+            "preserved_last_build": preserved_last_build,
+        },
+    }
+
+
+def recover_interrupted_generation_jobs(db: Session) -> int:
+    interrupted_jobs = (
+        db.query(GenerationJob)
+        .filter(
+            GenerationJob.deleted_at.is_(None),
+            GenerationJob.status.in_(["queued", "running"]),
+        )
+        .order_by(GenerationJob.created_at.asc())
+        .all()
+    )
+
+    recovered_count = 0
+    for job in interrupted_jobs:
+        project = (
+            db.query(Project)
+            .filter(Project.id == job.project_id, Project.deleted_at.is_(None))
+            .first()
+        )
+        if not project:
+            continue
+
+        failure_state = _apply_generation_failure_state(
+            project,
+            job,
+            "Generation was interrupted when the builder backend restarted.",
+            change_request=job.change_request,
+        )
+        add_project_message(
+            db,
+            project.id,
+            "assistant",
+            (
+                "The previous generation run was interrupted when the builder backend restarted. "
+                "The last working ERP version is still available."
+                if failure_state["preserved_last_build"]
+                else "The previous generation run was interrupted when the builder backend restarted. Please retry it."
+            ),
+            agent="system",
+        )
+        add_audit_log(
+            db,
+            "generation.recovered_after_restart",
+            "generation_job",
+            job.id,
+            user_id=job.requested_by_id,
+            project_id=project.id,
+            details={
+                **failure_state["audit_details"],
+                "reason": "builder_restart",
+            },
+        )
+        recovered_count += 1
+
+    if recovered_count:
+        db.commit()
+    return recovered_count
+
+
 def serialize_project(project: Project) -> ProjectRead:
     pipeline = {
         stage: PipelineStageRead.model_validate(data)
         for stage, data in ensure_pipeline_state(project).items()
     }
+    template_reference = get_project_template_reference(project, include_source_contents=False)
     return ProjectRead(
         id=project.id,
         owner_id=project.owner_id,
         name=project.name,
         description=project.description,
         prompt_text=project.prompt_text,
+        selected_template_id=template_reference.get("id"),
+        selected_template_name=template_reference.get("display_name") or template_reference.get("name"),
+        selected_template_reference=template_reference.get("reference_project"),
         status=project.status,
         lifecycle_state=project.lifecycle_state,
         requirement_completeness=project.requirement_completeness,
@@ -223,6 +390,568 @@ async def _run_in_process_background_tasks(background_tasks: InProcessBackground
             await result
 
 
+_UI_THEME_FAMILIES: dict[str, dict[str, str]] = {
+    "green": {
+        "primary_color": "#16A34A",
+        "accent_color": "#22C55E",
+        "accent_cyan": "#14B8A6",
+        "success_color": "#22C55E",
+    },
+    "teal": {
+        "primary_color": "#0F766E",
+        "accent_color": "#14B8A6",
+        "accent_cyan": "#22D3EE",
+        "success_color": "#14B8A6",
+    },
+    "blue": {
+        "primary_color": "#2563EB",
+        "accent_color": "#3B82F6",
+        "accent_cyan": "#06B6D4",
+        "success_color": "#22C55E",
+    },
+    "indigo": {
+        "primary_color": "#4338CA",
+        "accent_color": "#6366F1",
+        "accent_cyan": "#38BDF8",
+        "success_color": "#22C55E",
+    },
+    "purple": {
+        "primary_color": "#7C3AED",
+        "accent_color": "#A855F7",
+        "accent_cyan": "#22D3EE",
+        "success_color": "#22C55E",
+    },
+    "orange": {
+        "primary_color": "#EA580C",
+        "accent_color": "#F97316",
+        "accent_cyan": "#F59E0B",
+        "success_color": "#22C55E",
+    },
+    "red": {
+        "primary_color": "#DC2626",
+        "accent_color": "#EF4444",
+        "accent_cyan": "#FB7185",
+        "success_color": "#22C55E",
+    },
+    "slate": {
+        "primary_color": "#334155",
+        "accent_color": "#475569",
+        "accent_cyan": "#64748B",
+        "success_color": "#22C55E",
+    },
+}
+
+_UI_THEME_KEYWORDS = [
+    ("emerald", "green"),
+    ("lime", "green"),
+    ("forest", "green"),
+    ("green", "green"),
+    ("teal", "teal"),
+    ("cyan", "teal"),
+    ("turquoise", "teal"),
+    ("navy", "blue"),
+    ("blue", "blue"),
+    ("indigo", "indigo"),
+    ("violet", "purple"),
+    ("purple", "purple"),
+    ("orange", "orange"),
+    ("amber", "orange"),
+    ("yellow", "orange"),
+    ("red", "red"),
+    ("rose", "red"),
+    ("crimson", "red"),
+    ("slate", "slate"),
+    ("gray", "slate"),
+    ("grey", "slate"),
+    ("charcoal", "slate"),
+]
+
+_UI_THEME_INTENT_KEYWORDS = [
+    "theme",
+    "color",
+    "colors",
+    "colour",
+    "colours",
+    "palette",
+    "scheme",
+    "branding",
+    "brand",
+    "ui",
+    "ux",
+    "style",
+    "look",
+    "frontend",
+    "layout",
+    "navigation",
+    "nav",
+    "sidebar",
+    "side bar",
+    "topbar",
+    "top bar",
+    "header bar",
+    "dashboard",
+    "screen",
+    "button",
+    "card",
+]
+
+_MONOCHROME_THEME_HINTS = [
+    "single color",
+    "single colours",
+    "single colour",
+    "single colors",
+    "one color",
+    "one colour",
+    "one colours",
+    "one colors",
+    "monochrome",
+    "no other color",
+    "no other colours",
+    "no other colour",
+    "no other colors",
+]
+
+_UI_ONLY_REVISION_BLOCKERS = [
+    "backend",
+    "api",
+    "database",
+    "db ",
+    "schema",
+    "model",
+    "route",
+    "endpoint",
+    "auth",
+    "login",
+    "rbac",
+    "permission",
+    "workflow",
+    "approval",
+    "button",
+    "buttons",
+    "click",
+    "submit",
+    "save",
+    "create ",
+    "update ",
+    "delete ",
+    "integration",
+    "webhook",
+    "automation",
+    "n8n",
+    "localhost",
+    "run locally",
+    "server",
+]
+
+
+def _mentions_any(text: str, keywords: list[str]) -> bool:
+    return any(keyword in text for keyword in keywords)
+
+
+def _hex_to_rgba(hex_color: str, alpha: float) -> str | None:
+    candidate = str(hex_color or "").strip().lstrip("#")
+    if len(candidate) == 3:
+        candidate = "".join(character * 2 for character in candidate)
+    if len(candidate) != 6 or not re.fullmatch(r"[0-9a-fA-F]{6}", candidate):
+        return None
+
+    red = int(candidate[0:2], 16)
+    green = int(candidate[2:4], 16)
+    blue = int(candidate[4:6], 16)
+    return f"rgba({red}, {green}, {blue}, {alpha:.2f})"
+
+
+def _merge_nested_dicts(existing: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    for key, value in updates.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _merge_nested_dicts(current, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _detect_ui_theme_family(change_request: str) -> str | None:
+    for keyword, family in _UI_THEME_KEYWORDS:
+        if keyword in change_request:
+            return family
+    return None
+
+
+def _is_ui_theme_request(change_request: str, theme_family: str | None) -> bool:
+    if _mentions_any(change_request, _UI_THEME_INTENT_KEYWORDS):
+        return True
+    if not theme_family:
+        return False
+    if re.search(
+        r"\b(?:make|turn|change|switch|set|use|apply)\b[^\n\r]{0,24}\b(?:it|ui|ux|erp|frontend|dashboard|app|software|shell|theme)\b",
+        change_request,
+    ):
+        return True
+    return bool(re.search(r"\b(?:full|fully|completely|entirely|totally)\b", change_request))
+
+
+def _is_monochrome_theme_request(change_request: str) -> bool:
+    if _mentions_any(change_request, _MONOCHROME_THEME_HINTS):
+        return True
+    return bool(
+        re.search(r"\b(?:full|fully|completely|entirely|totally)\b", change_request)
+        and _detect_ui_theme_family(change_request)
+    )
+
+
+def _extract_ui_revision_directives(change_request: str | None) -> dict[str, Any]:
+    normalized_request = str(change_request or "").strip()
+    if not normalized_request:
+        return {}
+
+    lowered = normalized_request.lower()
+    theme_family = _detect_ui_theme_family(lowered)
+    ui_intent = _is_ui_theme_request(lowered, theme_family)
+    if not ui_intent:
+        return {}
+
+    directives: dict[str, Any] = {}
+
+    if theme_family:
+        palette = dict(_UI_THEME_FAMILIES.get(theme_family) or {})
+        if _is_monochrome_theme_request(lowered):
+            primary_color = str(palette.get("primary_color") or "")
+            accent_color = str(palette.get("accent_color") or primary_color)
+            palette["accent_color"] = accent_color
+            palette["accent_cyan"] = accent_color
+            palette["success_color"] = accent_color
+            palette["danger_color"] = primary_color or accent_color
+        border_color = _hex_to_rgba(palette.get("primary_color", ""), 0.22)
+        if border_color:
+            palette.setdefault("border_color", border_color)
+        directives["theme"] = palette
+
+    if _mentions_any(lowered, ["dark mode", "dark theme", "dark ui", "dark layout", "dark dashboard"]):
+        theme_directives = dict(directives.get("theme") or {})
+        theme_directives.update(
+            {
+                "background_color": "#06110B",
+                "surface_color": "#0D1B13",
+                "text_color": "#F0FDF4",
+                "muted_color": "#9FB7A7",
+            }
+        )
+        if "border_color" not in theme_directives and theme_family:
+            border_color = _hex_to_rgba(theme_directives.get("primary_color", ""), 0.24)
+            if border_color:
+                theme_directives["border_color"] = border_color
+        directives["theme"] = theme_directives
+
+    if _mentions_any(lowered, ["light mode", "light theme", "light ui", "light layout", "light dashboard"]):
+        theme_directives = dict(directives.get("theme") or {})
+        theme_directives.update(
+            {
+                "background_color": "#F6FCF8",
+                "surface_color": "#FFFFFF",
+                "text_color": "#052E16",
+                "muted_color": "#527067",
+            }
+        )
+        if "border_color" not in theme_directives and theme_family:
+            border_color = _hex_to_rgba(theme_directives.get("primary_color", ""), 0.18)
+            if border_color:
+                theme_directives["border_color"] = border_color
+        directives["theme"] = theme_directives
+
+    if _mentions_any(lowered, ["topbar", "top bar", "top navigation", "header nav", "horizontal nav", "top menu"]):
+        directives["layout_mode"] = "topbar"
+    elif _mentions_any(lowered, ["sidebar", "side bar", "side navigation", "left nav", "left menu"]):
+        directives["layout_mode"] = "sidebar"
+
+    if _mentions_any(lowered, ["compact", "dense", "condensed", "tighter", "tight layout"]):
+        directives["density"] = "compact"
+    elif _mentions_any(lowered, ["comfortable", "spacious", "airy", "relaxed layout"]):
+        directives["density"] = "comfortable"
+
+    sidebar_match = re.search(r"(?:sidebar|side\s*bar)[^\d]{0,24}(\d{2,4})\s*px", lowered)
+    if not sidebar_match:
+        sidebar_match = re.search(r"(\d{2,4})\s*px[^\n\r]{0,24}(?:sidebar|side\s*bar)", lowered)
+    if sidebar_match:
+        directives["sidebar_width"] = f"{sidebar_match.group(1)}px"
+
+    radius_match = re.search(r"(\d{1,3})\s*px[^\n\r]{0,16}(?:radius|rounded)", lowered)
+    if radius_match:
+        directives["border_radius"] = f"{radius_match.group(1)}px"
+
+    if directives:
+        directives["requested_change"] = normalized_request
+    return directives
+
+
+def _apply_ui_revision_directives(master_json: dict[str, Any], change_request: str | None) -> dict[str, Any]:
+    directives = _extract_ui_revision_directives(change_request)
+    if not directives:
+        return master_json
+
+    documentation = dict(master_json.get("documentation") or {})
+    existing_directives = documentation.get("ui_revision_directives")
+    if not isinstance(existing_directives, dict):
+        existing_directives = {}
+    documentation["ui_revision_directives"] = _merge_nested_dicts(existing_directives, directives)
+    master_json["documentation"] = documentation
+    return master_json
+
+
+def _has_ui_revision_directives(master_json: dict[str, Any]) -> bool:
+    documentation = master_json.get("documentation") or {}
+    directives = documentation.get("ui_revision_directives") if isinstance(documentation, dict) else {}
+    return isinstance(directives, dict) and bool(directives)
+
+
+def _is_ui_only_revision_request(change_request: str | None, master_json: dict[str, Any]) -> bool:
+    lowered = str(change_request or "").strip().lower()
+    if not lowered or not _has_ui_revision_directives(master_json):
+        return False
+    return not _mentions_any(lowered, _UI_ONLY_REVISION_BLOCKERS)
+
+
+def _build_frontend_revision_fallback_bundle(
+    master_json: dict[str, Any],
+    template_reference: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return _validate_bundle(build_template_driven_frontend_bundle(master_json, template_reference=template_reference))
+
+
+def _clone_json_payload(payload: Any) -> Any:
+    return json.loads(json.dumps(payload))
+
+
+def _can_attempt_direct_code_revision(revision_context: dict[str, Any]) -> bool:
+    return bool(
+        revision_context.get("project_version_id")
+        and revision_context.get("architecture")
+        and revision_context.get("master_json")
+        and revision_context.get("build_markdown")
+        and revision_context.get("frontend_bundle")
+        and revision_context.get("backend_bundle")
+    )
+
+
+def _persist_spec_artifacts(
+    db: Session,
+    project: Project,
+    job: GenerationJob,
+    *,
+    markdown_spec: str,
+    master_json: dict[str, Any],
+) -> None:
+    db.add(
+        GeneratedArtifact(
+            generation_job_id=job.id,
+            project_id=project.id,
+            artifact_type="spec",
+            file_path="spec/erp-build-guide.md",
+            language="markdown",
+            content_text=markdown_spec,
+            metadata_json={"source": "markdown_blueprint_generator"},
+        )
+    )
+    db.add(
+        GeneratedArtifact(
+            generation_job_id=job.id,
+            project_id=project.id,
+            artifact_type="spec",
+            file_path="spec/erp-blueprint.json",
+            language="json",
+            content_text=json.dumps(master_json, indent=2),
+            metadata_json={"source": "json_transformer"},
+        )
+    )
+
+
+def _persist_bundle_artifacts(
+    db: Session,
+    project: Project,
+    job: GenerationJob,
+    *,
+    artifact_type: str,
+    bundle: dict[str, Any],
+) -> None:
+    for generated_file in bundle.get("files", []):
+        db.add(
+            GeneratedArtifact(
+                generation_job_id=job.id,
+                project_id=project.id,
+                artifact_type=artifact_type,
+                file_path=generated_file["path"],
+                language=generated_file.get("language"),
+                content_text=generated_file["content"],
+                metadata_json={"dependencies": bundle.get("dependencies", {})},
+            )
+        )
+
+
+async def _finalize_generation_success(
+    db: Session,
+    project: Project,
+    job: GenerationJob,
+    *,
+    blueprint_id: str | None,
+    blueprint_reference: str | int | None = None,
+    architecture: dict[str, Any],
+    master_json: dict[str, Any],
+    markdown_spec: str,
+    frontend_bundle: dict[str, Any],
+    backend_bundle: dict[str, Any],
+    revision_context: dict[str, Any],
+    change_request: str | None,
+    code_only_revision: bool = False,
+) -> None:
+    update_stage(project, "frontend_generation", "complete", frontend_bundle)
+    update_stage(project, "backend_generation", "complete", backend_bundle)
+    _persist_spec_artifacts(db, project, job, markdown_spec=markdown_spec, master_json=master_json)
+    _persist_bundle_artifacts(db, project, job, artifact_type="frontend", bundle=frontend_bundle)
+    add_project_message(db, project.id, "assistant", "Frontend artifacts generated.", agent="frontend_generator")
+    _persist_bundle_artifacts(db, project, job, artifact_type="backend", bundle=backend_bundle)
+    add_project_message(db, project.id, "assistant", "Backend artifacts generated.", agent="backend_generator")
+    db.commit()
+
+    project.status = "REVIEWING"
+    job.current_stage = "code_review"
+    update_stage(project, "code_review", "running")
+    db.commit()
+
+    review = _validate_review(await code_reviewer(frontend_bundle, backend_bundle))
+    update_stage(project, "code_review", "complete", review)
+
+    project_version = ProjectVersion(
+        project_id=project.id,
+        blueprint_version_id=blueprint_id,
+        generation_job_id=job.id,
+        version_label=_next_project_version_label(db, project.id),
+        changelog=change_request or "Initial generated version",
+        snapshot_json={
+            "architecture": architecture,
+            "master_json": master_json,
+            "build_markdown": markdown_spec,
+            "review": review,
+            "base_project_version_id": revision_context.get("project_version_id"),
+        },
+    )
+    db.add(project_version)
+    db.flush()
+
+    project.current_project_version_id = project_version.id
+    project.status = "COMPLETE"
+    project.lifecycle_state = "generated"
+    job.status = "complete"
+    job.current_stage = "complete"
+    job.completed_at = utc_now()
+    job.result_summary_json = {
+        "blueprint_version_id": blueprint_id,
+        "project_version_id": project_version.id,
+        "base_project_version_id": revision_context.get("project_version_id"),
+        "markdown_spec_available": bool(markdown_spec),
+        "frontend_file_count": len(frontend_bundle.get("files", [])),
+        "backend_file_count": len(backend_bundle.get("files", [])),
+        "review_score": review.get("overall_score"),
+        "code_only_revision": code_only_revision,
+    }
+    add_project_message(
+        db,
+        project.id,
+        "assistant",
+        (
+            f"Your changes were applied directly on top of {revision_context.get('version_label', 'the previous version')}. "
+            f"Project version {project_version.version_label} is ready."
+            if change_request and code_only_revision
+            else (
+                f"Your changes have been applied on top of {revision_context.get('version_label', 'the previous version')}. "
+                f"Blueprint version {blueprint_reference or job.result_summary_json.get('blueprint_version_id')} and project version {project_version.version_label} are ready."
+                if change_request
+                else (
+                    f"Your ERP system is ready. Blueprint version {blueprint_reference or job.result_summary_json.get('blueprint_version_id')} and project version "
+                    f"{project_version.version_label} were generated successfully."
+                )
+            )
+        ),
+        agent="orchestrator",
+    )
+    add_notification(
+        db,
+        job.requested_by_id or project.owner_id,
+        "Generation completed",
+        f"Project {project.name} finished code generation successfully.",
+        project.id,
+    )
+    add_audit_log(
+        db,
+        "generation.completed",
+        "generation_job",
+        job.id,
+        user_id=job.requested_by_id,
+        project_id=project.id,
+        details=job.result_summary_json,
+    )
+    db.commit()
+
+
+async def _attempt_direct_code_revision(
+    db: Session,
+    project: Project,
+    job: GenerationJob,
+    *,
+    revision_context: dict[str, Any],
+    template_reference: dict[str, Any],
+    change_request: str,
+) -> bool:
+    if not _can_attempt_direct_code_revision(revision_context):
+        return False
+
+    architecture = _validate_architecture(_clone_json_payload(revision_context.get("architecture") or {}))
+    master_json = _validate_master_json(_clone_json_payload(revision_context.get("master_json") or {}))
+    master_json = attach_erp_ui_template_metadata(master_json, template_reference)
+    master_json = _apply_ui_revision_directives(master_json, change_request)
+    markdown_spec = str(revision_context.get("build_markdown") or "").strip()
+    if not markdown_spec:
+        raise RuntimeError("Existing ERP build markdown is unavailable for direct revision.")
+
+    documentation = dict(master_json.get("documentation") or {})
+    documentation["erp_build_markdown"] = markdown_spec
+    master_json["documentation"] = documentation
+
+    update_stage(project, "architecture", "complete", architecture)
+    update_stage(project, "json_transform", "complete", master_json)
+    project.status = "GENERATING_FRONTEND"
+    job.current_stage = "frontend_generation"
+    update_stage(project, "frontend_generation", "running")
+    update_stage(project, "backend_generation", "running")
+    db.commit()
+
+    frontend_bundle, backend_bundle = await generate_code_bundles(
+        master_json,
+        markdown_spec,
+        existing_frontend_bundle=revision_context.get("frontend_bundle"),
+        existing_backend_bundle=revision_context.get("backend_bundle"),
+        change_request=change_request,
+        template_reference=template_reference,
+    )
+
+    await _finalize_generation_success(
+        db,
+        project,
+        job,
+        blueprint_id=project.current_blueprint_version_id,
+        blueprint_reference=revision_context.get("version_label"),
+        architecture=architecture,
+        master_json=master_json,
+        markdown_spec=markdown_spec,
+        frontend_bundle=frontend_bundle,
+        backend_bundle=backend_bundle,
+        revision_context=revision_context,
+        change_request=change_request,
+        code_only_revision=True,
+    )
+    return True
+
+
 async def generate_code_bundles(
     master_json: dict[str, Any],
     markdown_spec: str,
@@ -232,6 +961,20 @@ async def generate_code_bundles(
     change_request: str | None = None,
     template_reference: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if (
+        change_request
+        and existing_frontend_bundle is not None
+        and existing_backend_bundle is not None
+        and _is_ui_only_revision_request(change_request, master_json)
+    ):
+        frontend_bundle = _build_frontend_revision_fallback_bundle(master_json, template_reference)
+        frontend_bundle = _merge_generated_bundle(existing_frontend_bundle, frontend_bundle)
+        backend_bundle = _validate_bundle(_clone_json_payload(existing_backend_bundle))
+        return frontend_bundle, backend_bundle
+
+    frontend_revision_fallback_allowed = (
+        bool(change_request) and existing_frontend_bundle is not None and _has_ui_revision_directives(master_json)
+    )
     frontend_result, backend_result = await asyncio.gather(
         _generate_candidate_code_bundle(
             frontend_generator,
@@ -261,10 +1004,24 @@ async def generate_code_bundles(
     backend_changed = False
 
     if isinstance(frontend_result, Exception):
-        errors.append(f"Frontend generation failed: {frontend_result}")
+        if frontend_revision_fallback_allowed:
+            try:
+                fallback_bundle = _build_frontend_revision_fallback_bundle(master_json, template_reference)
+                frontend_changed = _bundle_candidate_changes_existing(existing_frontend_bundle, fallback_bundle)
+                frontend_bundle = fallback_bundle
+            except Exception as exc:
+                errors.append(f"Frontend generation failed: {frontend_result}; fallback generation failed: {exc}")
+        else:
+            errors.append(f"Frontend generation failed: {frontend_result}")
     else:
         try:
             frontend_bundle, frontend_changed = frontend_result
+            if frontend_revision_fallback_allowed and not frontend_changed:
+                fallback_bundle = _build_frontend_revision_fallback_bundle(master_json, template_reference)
+                fallback_changed = _bundle_candidate_changes_existing(existing_frontend_bundle, fallback_bundle)
+                if fallback_changed:
+                    frontend_bundle = fallback_bundle
+                    frontend_changed = True
             if existing_frontend_bundle:
                 frontend_bundle = _merge_generated_bundle(existing_frontend_bundle, frontend_bundle)
         except Exception as exc:
@@ -289,6 +1046,7 @@ async def generate_code_bundles(
         and existing_backend_bundle is not None
         and not frontend_changed
         and not backend_changed
+        and not _is_rebuild_retry_request(change_request)
     ):
         raise RuntimeError("Revision request completed without changing either the frontend or backend generated code.")
 
@@ -466,7 +1224,10 @@ def hydrate_pipeline_outputs_from_current_version(db: Session, project: Project)
     snapshot = dict(project_version.snapshot_json or {})
     master_json_output = dict(snapshot.get("master_json") or {})
     if master_json_output:
-        master_json_output = attach_erp_ui_template_metadata(master_json_output)
+        master_json_output = attach_erp_ui_template_metadata(
+            master_json_output,
+            get_project_template_reference(project, include_source_contents=False),
+        )
         documentation = dict(master_json_output.get("documentation") or {})
         if snapshot.get("build_markdown") and not documentation.get("erp_build_markdown"):
             documentation["erp_build_markdown"] = snapshot.get("build_markdown")
@@ -534,7 +1295,10 @@ def _load_revision_context(db: Session, project: Project) -> dict[str, Any]:
         "version_label": project_version.version_label,
         "changelog": project_version.changelog,
         "architecture": snapshot.get("architecture") or {},
-        "master_json": attach_erp_ui_template_metadata(snapshot.get("master_json") or {}),
+        "master_json": attach_erp_ui_template_metadata(
+            snapshot.get("master_json") or {},
+            get_project_template_reference(project, include_source_contents=False),
+        ),
         "build_markdown": snapshot.get("build_markdown") or "",
         "review": snapshot.get("review") or {},
     }
@@ -595,6 +1359,54 @@ def _strengthen_revision_request(change_request: str | None, target: str) -> str
         f"You must directly modify the existing {target} code to implement this request. "
         "Return updated file contents for the files that need to change and do not send an unchanged bundle."
     )
+
+
+def _is_rebuild_retry_request(change_request: str | None) -> bool:
+    lowered = str(change_request or "").strip().lower()
+    if not lowered:
+        return False
+
+    direct_phrases = [
+        "rebuild",
+        "rebuilt",
+        "re-build",
+        "build again",
+        "rebuild it",
+        "rebuilt it",
+        "regenerate",
+        "generate again",
+        "rerun",
+        "re-run",
+        "run again",
+        "retry",
+        "try again",
+        "reubit",
+        "rebuit",
+        "rebuid",
+        "rebuild the app",
+        "rebuild the erp",
+        "rerun the build",
+    ]
+    if any(phrase in lowered for phrase in direct_phrases):
+        return True
+
+    normalized = re.sub(r"[^a-z0-9]+", " ", lowered).strip()
+    retry_only_messages = {
+        "again",
+        "retry",
+        "rerun",
+        "regenerate",
+        "rebuild",
+        "rebuilt",
+        "rebuild it",
+        "rebuilt it",
+        "reubit it",
+        "rebuit it",
+        "rebuid it",
+        "run again",
+        "try again",
+    }
+    return normalized in retry_only_messages
 
 
 def _bundle_candidate_changes_existing(
@@ -724,6 +1536,7 @@ async def _invoke_markdown_blueprint_generator(
 
 
 def create_project(db: Session, owner: User, payload: ProjectCreateRequest) -> Project:
+    selected_template_id = resolve_erp_ui_template_id(payload.template_id)
     project = Project(
         owner_id=owner.id,
         name=payload.name,
@@ -732,6 +1545,7 @@ def create_project(db: Session, owner: User, payload: ProjectCreateRequest) -> P
         status="INIT",
         lifecycle_state="draft",
         pipeline_state=default_pipeline_state(),
+        metadata_json={"selected_template_id": selected_template_id},
     )
     db.add(project)
     db.flush()
@@ -1019,12 +1833,46 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
         requirement_session = get_requirement_session(db, project)
         requirements = _validate_requirements(requirement_session.normalized_requirements)
         revision_context = _load_revision_context(db, project) if change_request else {}
-        template_reference = load_erp_ui_template()
+        template_reference = get_project_template_reference(project)
 
         job.status = "running"
         job.started_at = utc_now()
-        project.status = "ARCHITECTING"
         project.lifecycle_state = "revision_running" if change_request else "generation_running"
+        db.commit()
+
+        if change_request and _can_attempt_direct_code_revision(revision_context):
+            try:
+                direct_revision_applied = await _attempt_direct_code_revision(
+                    db,
+                    project,
+                    job,
+                    revision_context=revision_context,
+                    template_reference=template_reference,
+                    change_request=change_request,
+                )
+                if direct_revision_applied:
+                    return
+            except Exception as exc:
+                logger.warning(
+                    "Direct code revision fast path failed for project %s job %s: %s",
+                    project.id,
+                    job.id,
+                    exc,
+                )
+                db.rollback()
+                project = db.query(Project).filter(Project.id == project_id, Project.deleted_at.is_(None)).first()
+                job = db.query(GenerationJob).filter(GenerationJob.id == job_id).first()
+                if not project or not job:
+                    return
+                revision_context = _load_revision_context(db, project) if change_request else {}
+                template_reference = get_project_template_reference(project)
+                reset_generation_stages(
+                    project,
+                    preserve_existing_outputs=bool(change_request and project.current_project_version_id),
+                )
+                db.commit()
+
+        project.status = "ARCHITECTING"
         update_stage(project, "architecture", "running")
         db.commit()
 
@@ -1066,6 +1914,7 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
             )
         )
         master_json = attach_erp_ui_template_metadata(master_json, template_reference)
+        master_json = _apply_ui_revision_directives(master_json, change_request)
         conversation_transcript = build_chat_transcript(db, project.id)
         markdown_spec = await _invoke_markdown_blueprint_generator(
             markdown_blueprint_generator,
@@ -1087,29 +1936,6 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
         add_project_message(db, project.id, "assistant", "Blueprint normalized into the master ERP JSON contract.", agent="json_transformer")
         db.commit()
 
-        db.add(
-            GeneratedArtifact(
-                generation_job_id=job.id,
-                project_id=project.id,
-                artifact_type="spec",
-                file_path="spec/erp-build-guide.md",
-                language="markdown",
-                content_text=markdown_spec,
-                metadata_json={"source": "markdown_blueprint_generator"},
-            )
-        )
-        db.add(
-            GeneratedArtifact(
-                generation_job_id=job.id,
-                project_id=project.id,
-                artifact_type="spec",
-                file_path="spec/erp-blueprint.json",
-                language="json",
-                content_text=json.dumps(master_json, indent=2),
-                metadata_json={"source": "json_transformer"},
-            )
-        )
-
         project.status = "GENERATING_FRONTEND"
         job.current_stage = "frontend_generation"
         update_stage(project, "frontend_generation", "running")
@@ -1124,131 +1950,38 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
             change_request=change_request,
             template_reference=template_reference,
         )
-        update_stage(project, "frontend_generation", "complete", frontend_bundle)
-        update_stage(project, "backend_generation", "complete", backend_bundle)
-        for generated_file in frontend_bundle.get("files", []):
-            db.add(
-                GeneratedArtifact(
-                    generation_job_id=job.id,
-                    project_id=project.id,
-                    artifact_type="frontend",
-                    file_path=generated_file["path"],
-                    language=generated_file.get("language"),
-                    content_text=generated_file["content"],
-                    metadata_json={"dependencies": frontend_bundle.get("dependencies", {})},
-                )
-            )
-        add_project_message(db, project.id, "assistant", "Frontend artifacts generated.", agent="frontend_generator")
-        for generated_file in backend_bundle.get("files", []):
-            db.add(
-                GeneratedArtifact(
-                    generation_job_id=job.id,
-                    project_id=project.id,
-                    artifact_type="backend",
-                    file_path=generated_file["path"],
-                    language=generated_file.get("language"),
-                    content_text=generated_file["content"],
-                    metadata_json={"dependencies": backend_bundle.get("dependencies", {})},
-                )
-            )
-        add_project_message(db, project.id, "assistant", "Backend artifacts generated.", agent="backend_generator")
-        db.commit()
-
-        project.status = "REVIEWING"
-        job.current_stage = "code_review"
-        update_stage(project, "code_review", "running")
-        db.commit()
-
-        review = _validate_review(await code_reviewer(frontend_bundle, backend_bundle))
-        update_stage(project, "code_review", "complete", review)
-
-        project_version = ProjectVersion(
-            project_id=project.id,
-            blueprint_version_id=blueprint.id,
-            generation_job_id=job.id,
-            version_label=_next_project_version_label(db, project.id),
-            changelog=change_request or "Initial generated version",
-            snapshot_json={
-                "architecture": architecture,
-                "master_json": master_json,
-                "build_markdown": markdown_spec,
-                "review": review,
-                "base_project_version_id": revision_context.get("project_version_id"),
-            },
-        )
-        db.add(project_version)
-        db.flush()
-
-        project.current_project_version_id = project_version.id
-        project.status = "COMPLETE"
-        project.lifecycle_state = "generated"
-        job.status = "complete"
-        job.current_stage = "complete"
-        job.completed_at = utc_now()
-        job.result_summary_json = {
-            "blueprint_version_id": blueprint.id,
-            "project_version_id": project_version.id,
-            "base_project_version_id": revision_context.get("project_version_id"),
-            "markdown_spec_available": bool(markdown_spec),
-            "frontend_file_count": len(frontend_bundle.get("files", [])),
-            "backend_file_count": len(backend_bundle.get("files", [])),
-            "review_score": review.get("overall_score"),
-        }
-        add_project_message(
+        await _finalize_generation_success(
             db,
-            project.id,
-            "assistant",
-            (
-                f"Your changes have been applied on top of {revision_context.get('version_label', 'the previous version')}. "
-                f"Blueprint version {blueprint.version_number} and project version {project_version.version_label} are ready."
-                if change_request
-                else (
-                    f"Your ERP system is ready. Blueprint version {blueprint.version_number} and project version "
-                    f"{project_version.version_label} were generated successfully."
-                )
-            ),
-            agent="orchestrator",
+            project,
+            job,
+            blueprint_id=blueprint.id,
+            blueprint_reference=blueprint.version_number,
+            architecture=architecture,
+            master_json=master_json,
+            markdown_spec=markdown_spec,
+            frontend_bundle=frontend_bundle,
+            backend_bundle=backend_bundle,
+            revision_context=revision_context,
+            change_request=change_request,
         )
-        add_notification(
-            db,
-            job.requested_by_id or project.owner_id,
-            "Generation completed",
-            f"Project {project.name} finished code generation successfully.",
-            project.id,
-        )
-        add_audit_log(
-            db,
-            "generation.completed",
-            "generation_job",
-            job.id,
-            user_id=job.requested_by_id,
-            project_id=project.id,
-            details=job.result_summary_json,
-        )
-        db.commit()
     except Exception as exc:
         db.rollback()
         project = db.query(Project).filter(Project.id == project_id).first()
         job = db.query(GenerationJob).filter(GenerationJob.id == job_id).first()
         if project and job:
-            project.status = "ERROR"
-            project.lifecycle_state = "error"
-            job.status = "failed"
-            job.error_message = str(exc)
-            job.completed_at = utc_now()
-            update_stage(project, job.current_stage or "architecture", "failed", {"error": str(exc)})
+            failure_state = _apply_generation_failure_state(project, job, str(exc), change_request=change_request)
             add_project_message(
                 db,
                 project.id,
                 "assistant",
-                "Generation failed. Please review the job logs and retry with a refined change request.",
+                failure_state["message"],
                 agent="system",
             )
             add_notification(
                 db,
                 job.requested_by_id or project.owner_id,
-                "Generation failed",
-                f"Project {project.name} encountered an error during generation.",
+                failure_state["notification_title"],
+                failure_state["notification_body"],
                 project.id,
             )
             add_audit_log(
@@ -1258,7 +1991,7 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
                 job.id,
                 user_id=job.requested_by_id,
                 project_id=project.id,
-                details={"error": str(exc)},
+                details=failure_state["audit_details"],
             )
             db.commit()
     finally:
@@ -1345,7 +2078,7 @@ async def ensure_markdown_documentation(db: Session, project: Project) -> dict[s
     if not output:
         return output
 
-    template_reference = load_erp_ui_template()
+    template_reference = get_project_template_reference(project)
     output = attach_erp_ui_template_metadata(output, template_reference)
     metadata_changed = output != original_output
     documentation = dict(output.get("documentation") or {})

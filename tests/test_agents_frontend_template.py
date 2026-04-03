@@ -30,16 +30,22 @@ def test_template_driven_frontend_file_bundle_uses_template_profile():
         "documentation": {
             "erp_ui_template": {
                 "name": "Template 1",
+                "display_name": "Template 1 - Athena",
+                "reference_project": "Athena",
                 "status": "ready",
                 "summary": "A compact command-center layout for operations teams.",
             }
         },
     }
     template_reference = {
+        "id": "template_1",
         "name": "Template 1",
+        "display_name": "Template 1 - Athena",
+        "reference_project": "Athena",
         "status": "ready",
         "summary": "A compact command-center layout for operations teams.",
-        "json_data": {
+        "design_cues": {
+            "project": "Athena",
             "theme": {
                 "palette": {
                     "primary": "#123456",
@@ -64,6 +70,7 @@ def test_template_driven_frontend_file_bundle_uses_template_profile():
     assert 'import "./styles/template.css";' in file_map["src/App.jsx"]
     assert '"layout_mode": "topbar"' in file_map["src/data/schema.js"]
     assert '"sidebar_width": "260px"' in file_map["src/data/schema.js"]
+    assert '"reference_project": "Athena"' in file_map["src/data/schema.js"]
     assert "Command the workflow" in file_map["src/data/schema.js"]
     assert "#123456" in file_map["src/styles/template.css"]
     assert "useLocation" in file_map["src/components/Layout.jsx"]
@@ -74,6 +81,68 @@ def test_template_driven_frontend_file_bundle_uses_template_profile():
     assert "/api/modules/" in file_map["src/lib/api.js"]
 
 
+def test_template_driven_frontend_bundle_applies_ui_revision_overrides():
+    master_json = {
+        "system": {"name": "Template Driven ERP", "description": "Operational workspace"},
+        "modules": [{"id": "sales", "name": "Sales", "entities": [], "workflows": [], "endpoints": []}],
+        "documentation": {
+            "erp_ui_template": {
+                "name": "Template 1",
+                "display_name": "Template 1 - Athena",
+                "reference_project": "Athena",
+                "status": "ready",
+                "summary": "A compact command-center layout for operations teams.",
+            },
+            "ui_revision_directives": {
+                "theme": {
+                    "primary_color": "#16A34A",
+                    "accent_color": "#22C55E",
+                    "background_color": "#06110B",
+                    "surface_color": "#0D1B13",
+                    "text_color": "#F0FDF4",
+                    "muted_color": "#9FB7A7",
+                },
+                "layout_mode": "topbar",
+                "density": "compact",
+                "sidebar_width": "300px",
+                "border_radius": "18px",
+            },
+        },
+    }
+    template_reference = {
+        "id": "template_1",
+        "name": "Template 1",
+        "display_name": "Template 1 - Athena",
+        "reference_project": "Athena",
+        "status": "ready",
+        "summary": "A compact command-center layout for operations teams.",
+        "design_cues": {
+            "project": "Athena",
+            "theme": {
+                "palette": {
+                    "primary": "#123456",
+                    "secondary": "#654321",
+                    "background": "#f7f6f2",
+                    "surface": "#ffffff",
+                    "text": {"primary": "#0f172a", "secondary": "#475569"},
+                    "border": "#dbe4f0",
+                }
+            },
+            "components": {"sidebar": {"width": "260px"}},
+            "layout": {"navigation": "sidebar", "density": "comfortable"},
+        },
+    }
+
+    bundle = build_template_driven_frontend_bundle(master_json, template_reference=template_reference)
+    file_map = {item["path"]: item["content"] for item in bundle["files"]}
+
+    assert "#16A34A" in file_map["src/styles/template.css"]
+    assert '"layout_mode": "topbar"' in file_map["src/data/schema.js"]
+    assert '"density": "compact"' in file_map["src/data/schema.js"]
+    assert '"sidebar_width": "300px"' in file_map["src/data/schema.js"]
+    assert '"border_radius": "18px"' in file_map["src/data/schema.js"]
+
+
 def test_frontend_generator_uses_template_bundle_when_template_is_actionable():
     master_json = {
         "system": {"name": "ERP", "description": "Desc"},
@@ -81,11 +150,15 @@ def test_frontend_generator_uses_template_bundle_when_template_is_actionable():
         "documentation": {"erp_ui_template": {"name": "Template 1", "summary": "Summary", "status": "ready"}},
     }
     template_reference = {
+        "id": "template_1",
         "name": "Template 1",
+        "display_name": "Template 1 - Athena",
+        "reference_project": "Athena",
         "status": "ready",
         "summary": "Summary",
         "has_actionable_content": True,
-        "json_data": {
+        "design_cues": {
+            "project": "Athena",
             "layout": {"navigation": "topbar"},
             "theme": {"palette": {"primary": "#123456", "secondary": "#654321", "text": {"primary": "#ffffff"}}},
         },
@@ -99,6 +172,56 @@ def test_frontend_generator_uses_template_bundle_when_template_is_actionable():
     assert "ModuleWorkspace" in file_map["src/App.jsx"]
     assert "src/lib/api.js" in file_map
     assert "generated-erp-session" in file_map["src/lib/api.js"]
+
+
+def test_frontend_generator_revision_attempts_model_before_template_fallback(monkeypatch):
+    master_json = {
+        "system": {"name": "ERP", "description": "Desc"},
+        "modules": [{"id": "sales", "name": "Sales", "entities": [], "workflows": [], "endpoints": []}],
+        "documentation": {
+            "erp_ui_template": {"name": "Template 1", "summary": "Summary", "status": "ready"},
+            "ui_revision_directives": {
+                "theme": {"primary_color": "#16A34A", "accent_color": "#22C55E"},
+                "layout_mode": "topbar",
+            },
+        },
+    }
+    template_reference = {
+        "id": "template_1",
+        "name": "Template 1",
+        "display_name": "Template 1 - Athena",
+        "reference_project": "Athena",
+        "status": "ready",
+        "summary": "Summary",
+        "has_actionable_content": True,
+        "design_cues": {
+            "project": "Athena",
+            "layout": {"navigation": "sidebar"},
+            "theme": {"palette": {"primary": "#123456", "secondary": "#654321", "text": {"primary": "#ffffff"}}},
+        },
+    }
+    llm_calls = {"count": 0}
+
+    async def fake_call_llm(messages, temperature=0.3, max_tokens=None, timeout=None, model_group=None):
+        llm_calls["count"] += 1
+        raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr(agents, "call_llm", fake_call_llm)
+
+    bundle = asyncio.run(
+        agents.frontend_generator(
+            master_json,
+            "# guide",
+            existing_bundle={"files": [], "dependencies": {}},
+            change_request="Change the ERP to a green theme with a topbar.",
+            template_reference=template_reference,
+        )
+    )
+    file_map = {item["path"]: item["content"] for item in bundle["files"]}
+
+    assert llm_calls["count"] == 1
+    assert "#16A34A" in file_map["src/styles/template.css"]
+    assert '"layout_mode": "topbar"' in file_map["src/data/schema.js"]
 
 
 def test_backend_fallback_bundle_uses_routes_package_init():

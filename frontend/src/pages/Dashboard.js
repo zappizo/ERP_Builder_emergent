@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { listProjects, createProject, deleteProject } from "@/lib/api";
+import { listProjects, listProjectTemplates, createProject, deleteProject } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -31,6 +31,33 @@ const EXAMPLES = [
   "Design an ERP for a construction company with project management, procurement, and HR",
 ];
 
+const FALLBACK_TEMPLATES = [
+  {
+    id: "template_1",
+    name: "Template 1",
+    display_name: "Template 1 - Athena",
+    reference_project: "Athena",
+    summary: "Dark control-center ERP shell with glass panels, staged workflows, and action-heavy operations views.",
+    source_files: [
+      { relative_path: "Template/Template 1/style.css", role: "theme" },
+      { relative_path: "Template/Template 1/templates.ts", role: "ui-shell" },
+      { relative_path: "Template/Template 1/main.ts", role: "app-entry" },
+    ],
+  },
+  {
+    id: "template_2",
+    name: "Template 2",
+    display_name: "Template 2 - Print Co",
+    reference_project: "Print Co",
+    summary: "Warm paper-toned ERP shell with horizontal module navigation, structured tables, and export-first actions.",
+    source_files: [
+      { relative_path: "Template/Template 2/styles.css", role: "theme" },
+      { relative_path: "Template/Template 2/app.js", role: "ui-shell" },
+      { relative_path: "Template/Template 2/ui-enhance.js", role: "ui-enhancements" },
+    ],
+  },
+];
+
 const CREATE_RECOVERY_DELAY_MS = 2500;
 const CREATE_RECOVERY_POLL_MS = 1500;
 const CREATE_RECOVERY_ATTEMPTS = 8;
@@ -40,10 +67,11 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isRecentProjectMatch(project, name, prompt) {
+function isRecentProjectMatch(project, name, prompt, templateId) {
   if (!project) return false;
   if ((project.name || "").trim() !== name) return false;
   if ((project.prompt || "").trim() !== prompt) return false;
+  if ((project.selected_template_id || "").trim() !== (templateId || "").trim()) return false;
 
   const timestamp = Date.parse(project.created_at || project.updated_at || "");
   if (!Number.isFinite(timestamp)) return false;
@@ -71,13 +99,18 @@ function describeCreateError(error) {
 export default function Dashboard() {
   const navigate = useNavigate();
   const [projects, setProjects] = useState([]);
+  const [templates, setTemplates] = useState(FALLBACK_TEMPLATES);
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [templateId, setTemplateId] = useState(FALLBACK_TEMPLATES[0].id);
   const [creating, setCreating] = useState(false);
   const [createStatusMessage, setCreateStatusMessage] = useState("");
 
-  useEffect(() => { loadProjects(); }, []);
+  useEffect(() => {
+    loadProjects();
+    loadTemplates();
+  }, []);
 
   async function loadProjects() {
     try {
@@ -86,11 +119,21 @@ export default function Dashboard() {
     } catch { /* ignore */ }
   }
 
-  async function findRecentCreatedProject(projectName, projectPrompt) {
+  async function loadTemplates() {
+    try {
+      const data = await listProjectTemplates();
+      if (Array.isArray(data) && data.length > 0) {
+        setTemplates(data);
+        setTemplateId((current) => current || data[0].id);
+      }
+    } catch { /* ignore */ }
+  }
+
+  async function findRecentCreatedProject(projectName, projectPrompt, selectedTemplateId) {
     try {
       const items = await listProjects();
       return items
-        .filter((project) => isRecentProjectMatch(project, projectName, projectPrompt))
+        .filter((project) => isRecentProjectMatch(project, projectName, projectPrompt, selectedTemplateId))
         .sort((a, b) => Date.parse(b.created_at || b.updated_at || "") - Date.parse(a.created_at || a.updated_at || ""))[0] || null;
     } catch {
       return null;
@@ -101,8 +144,10 @@ export default function Dashboard() {
     if (!name.trim() || !prompt.trim()) { toast.error("Fill in all fields"); return; }
     const projectName = name.trim();
     const projectPrompt = prompt.trim();
+    const selectedTemplateId = templateId || templates[0]?.id || FALLBACK_TEMPLATES[0].id;
+    const selectedTemplate = templates.find((item) => item.id === selectedTemplateId) || FALLBACK_TEMPLATES[0];
     setCreating(true);
-    setCreateStatusMessage("Creating the project shell. The builder page should open in a moment.");
+    setCreateStatusMessage(`Creating the project shell with ${selectedTemplate.display_name}. The builder page should open in a moment.`);
 
     let navigated = false;
     const openProject = (project, source) => {
@@ -125,7 +170,7 @@ export default function Dashboard() {
       );
 
       for (let attempt = 0; attempt < CREATE_RECOVERY_ATTEMPTS && !navigated; attempt += 1) {
-        const existingProject = await findRecentCreatedProject(projectName, projectPrompt);
+        const existingProject = await findRecentCreatedProject(projectName, projectPrompt, selectedTemplateId);
         if (existingProject) {
           return existingProject;
         }
@@ -136,7 +181,7 @@ export default function Dashboard() {
     })();
 
     try {
-      const createRequest = createProject(projectName, projectPrompt);
+      const createRequest = createProject(projectName, projectPrompt, selectedTemplateId);
       const firstResult = await Promise.race([
         createRequest.then((project) => ({ source: "create-response", project })),
         recoveryPromise.then((project) => (project ? { source: "recovered-project", project } : null)),
@@ -152,7 +197,7 @@ export default function Dashboard() {
         openProject(project, "create-response");
       }
     } catch (e) {
-      const existingProject = await findRecentCreatedProject(projectName, projectPrompt);
+      const existingProject = await findRecentCreatedProject(projectName, projectPrompt, selectedTemplateId);
       if (existingProject && !navigated) {
         openProject(existingProject, "recovered-after-error");
         return;
@@ -181,6 +226,8 @@ export default function Dashboard() {
     setPrompt(ex);
     setName(ex.split(" for ")[1]?.split(" with")[0] || "My ERP Project");
   }
+
+  const activeTemplate = templates.find((item) => item.id === templateId) || templates[0] || FALLBACK_TEMPLATES[0];
 
   return (
     <div className="min-h-screen" data-testid="dashboard-page">
@@ -272,6 +319,11 @@ export default function Dashboard() {
                     </button>
                   </div>
                   <p className="text-sm text-[var(--zap-text-muted)] line-clamp-2 mb-4">{p.prompt}</p>
+                  {p.selected_template_name && (
+                    <p className="text-xs text-[var(--zap-text-muted)] mb-4">
+                      ERP template: {p.selected_template_name}
+                    </p>
+                  )}
                   <div className="flex items-center justify-between">
                     <Badge className={`${STATUS_COLORS[p.status] || STATUS_COLORS.INIT} text-xs uppercase tracking-widest rounded-sm border-0`}>
                       {p.status}
@@ -329,6 +381,39 @@ export default function Dashboard() {
               />
             </div>
             <div>
+              <label className="text-sm font-medium text-[var(--zap-text-heading)] mb-1.5 block">
+                ERP Template
+              </label>
+              <select
+                data-testid="project-template-select"
+                value={templateId}
+                onChange={(e) => setTemplateId(e.target.value)}
+                className="flex h-10 w-full rounded-sm border border-[var(--zap-border)] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--zap-accent)]"
+              >
+                {templates.map((template) => (
+                  <option key={template.id} value={template.id}>
+                    {template.display_name}
+                  </option>
+                ))}
+              </select>
+              {activeTemplate && (
+                <div className="mt-3 rounded-sm border border-[var(--zap-border)] bg-[var(--zap-bg)] px-3 py-2.5">
+                  <p className="text-xs font-medium uppercase tracking-[0.18em] text-[var(--zap-text-muted)]">
+                    Reference UI/UX
+                  </p>
+                  <p className="mt-1 text-sm text-[var(--zap-text-heading)]">
+                    {activeTemplate.display_name} uses {activeTemplate.reference_project} as the generated ERP reference.
+                  </p>
+                  <p className="mt-2 text-xs text-[var(--zap-text-body)] leading-relaxed">
+                    {activeTemplate.summary}
+                  </p>
+                  <p className="mt-2 text-[11px] text-[var(--zap-text-muted)]">
+                    Source files: {(activeTemplate.source_files || []).map((file) => file.relative_path).join(", ")}
+                  </p>
+                </div>
+              )}
+            </div>
+            <div>
               <p className="text-xs text-[var(--zap-text-muted)] mb-2">Quick examples:</p>
               <div className="flex flex-wrap gap-2">
                 {EXAMPLES.map((ex, i) => (
@@ -349,7 +434,7 @@ export default function Dashboard() {
               </p>
               <p className="mt-1 text-xs text-[var(--zap-text-body)] leading-relaxed">
                 This button only creates the project shell. Once that returns, the builder page opens and shows the live AI stages:
-                analysis, clarification, architecture, JSON and Markdown specs, frontend, backend, and review.
+                analysis, clarification, architecture, ERP blueprint, frontend, backend, and review. The selected template only affects the ERP being generated, not this builder UI.
               </p>
             </div>
             {createStatusMessage && (

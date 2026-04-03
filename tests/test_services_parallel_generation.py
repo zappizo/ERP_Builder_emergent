@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from backend.app import services
 from backend.app.template_loader import attach_erp_ui_template_metadata
+from backend.app.template_frontend_bundle import build_template_driven_frontend_bundle
 
 
 def test_generate_code_bundles_runs_generators_in_parallel(monkeypatch):
@@ -194,6 +195,409 @@ def test_generate_code_bundles_raises_when_revision_makes_no_code_changes(monkey
         )
 
 
+def test_generate_code_bundles_allows_retry_only_revision_without_code_diff(monkeypatch):
+    async def fake_frontend(master_json, markdown_spec, existing_bundle=None, change_request=None):
+        return {
+            "files": [{"path": "src/App.jsx", "language": "jsx", "content": "same"}],
+            "dependencies": {"react": "^18.0.0"},
+        }
+
+    async def fake_backend(master_json, markdown_spec, existing_bundle=None, change_request=None):
+        return {
+            "files": [{"path": "main.py", "language": "python", "content": "same"}],
+            "dependencies": {"fastapi": ">=0.100.0"},
+        }
+
+    monkeypatch.setattr(services, "frontend_generator", fake_frontend)
+    monkeypatch.setattr(services, "backend_generator", fake_backend)
+
+    frontend_bundle, backend_bundle = asyncio.run(
+        services.generate_code_bundles(
+            {"modules": []},
+            "# spec",
+            existing_frontend_bundle={
+                "files": [{"path": "src/App.jsx", "language": "jsx", "content": "same"}],
+                "dependencies": {"react": "^18.0.0"},
+            },
+            existing_backend_bundle={
+                "files": [{"path": "main.py", "language": "python", "content": "same"}],
+                "dependencies": {"fastapi": ">=0.100.0"},
+            },
+            change_request="reubit it.",
+        )
+    )
+
+    assert frontend_bundle["files"][0]["content"] == "same"
+    assert backend_bundle["files"][0]["content"] == "same"
+
+
+def test_generate_code_bundles_allows_rebuilt_retry_without_code_diff(monkeypatch):
+    async def fake_frontend(master_json, markdown_spec, existing_bundle=None, change_request=None):
+        return {
+            "files": [{"path": "src/App.jsx", "language": "jsx", "content": "same"}],
+            "dependencies": {"react": "^18.0.0"},
+        }
+
+    async def fake_backend(master_json, markdown_spec, existing_bundle=None, change_request=None):
+        return {
+            "files": [{"path": "main.py", "language": "python", "content": "same"}],
+            "dependencies": {"fastapi": ">=0.100.0"},
+        }
+
+    monkeypatch.setattr(services, "frontend_generator", fake_frontend)
+    monkeypatch.setattr(services, "backend_generator", fake_backend)
+
+    frontend_bundle, backend_bundle = asyncio.run(
+        services.generate_code_bundles(
+            {"modules": []},
+            "# spec",
+            existing_frontend_bundle={
+                "files": [{"path": "src/App.jsx", "language": "jsx", "content": "same"}],
+                "dependencies": {"react": "^18.0.0"},
+            },
+            existing_backend_bundle={
+                "files": [{"path": "main.py", "language": "python", "content": "same"}],
+                "dependencies": {"fastapi": ">=0.100.0"},
+            },
+            change_request="rebuilt it.",
+        )
+    )
+
+    assert frontend_bundle["files"][0]["content"] == "same"
+    assert backend_bundle["files"][0]["content"] == "same"
+
+
+def test_apply_ui_revision_directives_extracts_theme_layout_and_density():
+    master_json = {"system": {"name": "ERP"}, "documentation": {}}
+
+    updated_master_json = services._apply_ui_revision_directives(
+        master_json,
+        "Change the ERP to a green based dark theme with a topbar, compact layout, and a 300px sidebar.",
+    )
+
+    directives = updated_master_json["documentation"]["ui_revision_directives"]
+
+    assert directives["theme"]["primary_color"] == "#16A34A"
+    assert directives["theme"]["background_color"] == "#06110B"
+    assert directives["layout_mode"] == "topbar"
+    assert directives["density"] == "compact"
+    assert directives["sidebar_width"] == "300px"
+
+
+def test_apply_ui_revision_directives_supports_colour_spelling_and_monochrome_requests():
+    master_json = {"system": {"name": "ERP"}, "documentation": {}}
+
+    updated_master_json = services._apply_ui_revision_directives(
+        master_json,
+        "Change the ERP into full red colour i want it completely red no other colour.",
+    )
+
+    directives = updated_master_json["documentation"]["ui_revision_directives"]
+
+    assert directives["theme"]["primary_color"] == "#DC2626"
+    assert directives["theme"]["accent_color"] == "#EF4444"
+    assert directives["theme"]["accent_cyan"] == "#EF4444"
+    assert directives["theme"]["success_color"] == "#EF4444"
+    assert directives["theme"]["danger_color"] == "#DC2626"
+    assert directives["requested_change"] == "Change the ERP into full red colour i want it completely red no other colour."
+
+
+def test_generate_code_bundles_applies_template_revision_overrides(monkeypatch):
+    template_reference = {
+        "id": "template_1",
+        "name": "Template 1",
+        "display_name": "Template 1 - Athena",
+        "reference_project": "Athena",
+        "status": "ready",
+        "summary": "Command center layout.",
+        "has_actionable_content": True,
+        "design_cues": {
+            "project": "Athena",
+            "theme": {
+                "palette": {
+                    "primary": "#123456",
+                    "secondary": "#654321",
+                    "background": "#0B1220",
+                    "surface": "#111827",
+                    "text": {"primary": "#F8FAFC", "secondary": "#CBD5E1"},
+                    "border": "#1E293B",
+                }
+            },
+            "layout": {"navigation": "sidebar", "density": "comfortable"},
+            "components": {"sidebar": {"width": "260px"}},
+        },
+    }
+    base_master_json = attach_erp_ui_template_metadata(
+        {
+            "system": {"name": "Template ERP", "description": "Generated ERP"},
+            "modules": [{"id": "sales", "name": "Sales", "entities": [], "workflows": [], "endpoints": []}],
+            "documentation": {},
+        },
+        template_reference,
+    )
+    revised_master_json = services._apply_ui_revision_directives(
+        {
+            "system": base_master_json["system"],
+            "modules": base_master_json["modules"],
+            "documentation": dict(base_master_json.get("documentation") or {}),
+        },
+        "Change the theme to a green based dark theme.",
+    )
+    existing_frontend_bundle = build_template_driven_frontend_bundle(base_master_json, template_reference=template_reference)
+
+    async def fake_frontend(master_json, markdown_spec, existing_bundle=None, change_request=None, template_reference=None):
+        return build_template_driven_frontend_bundle(master_json, template_reference=template_reference)
+
+    async def fake_backend(master_json, markdown_spec, existing_bundle=None, change_request=None, template_reference=None):
+        return {
+            "files": [{"path": "main.py", "language": "python", "content": "app = 'same'"}],
+            "dependencies": {"fastapi": ">=0.100.0"},
+        }
+
+    monkeypatch.setattr(services, "frontend_generator", fake_frontend)
+    monkeypatch.setattr(services, "backend_generator", fake_backend)
+
+    frontend_bundle, _ = asyncio.run(
+        services.generate_code_bundles(
+            revised_master_json,
+            "# spec",
+            existing_frontend_bundle=existing_frontend_bundle,
+            existing_backend_bundle={
+                "files": [{"path": "main.py", "language": "python", "content": "app = 'same'"}],
+                "dependencies": {"fastapi": ">=0.100.0"},
+            },
+            change_request="Change the theme to a green based dark theme.",
+            template_reference=template_reference,
+        )
+    )
+
+    file_map = {file["path"]: file["content"] for file in frontend_bundle["files"]}
+    assert "#16A34A" in file_map["src/styles/template.css"]
+    assert '"primary_color": "#16A34A"' in file_map["src/data/schema.js"]
+
+
+def test_generate_code_bundles_applies_colour_spelling_revision_overrides(monkeypatch):
+    template_reference = {
+        "id": "template_1",
+        "name": "Template 1",
+        "display_name": "Template 1 - Athena",
+        "reference_project": "Athena",
+        "status": "ready",
+        "summary": "Command center layout.",
+        "has_actionable_content": True,
+        "design_cues": {
+            "project": "Athena",
+            "theme": {
+                "palette": {
+                    "primary": "#123456",
+                    "secondary": "#654321",
+                    "background": "#0B1220",
+                    "surface": "#111827",
+                    "text": {"primary": "#F8FAFC", "secondary": "#CBD5E1"},
+                    "border": "#1E293B",
+                }
+            },
+            "layout": {"navigation": "sidebar", "density": "comfortable"},
+            "components": {"sidebar": {"width": "260px"}},
+        },
+    }
+    base_master_json = attach_erp_ui_template_metadata(
+        {
+            "system": {"name": "Template ERP", "description": "Generated ERP"},
+            "modules": [{"id": "sales", "name": "Sales", "entities": [], "workflows": [], "endpoints": []}],
+            "documentation": {},
+        },
+        template_reference,
+    )
+    revised_master_json = services._apply_ui_revision_directives(
+        {
+            "system": base_master_json["system"],
+            "modules": base_master_json["modules"],
+            "documentation": dict(base_master_json.get("documentation") or {}),
+        },
+        "change the erp into full red colour i want it completely red no other colour",
+    )
+    existing_frontend_bundle = build_template_driven_frontend_bundle(base_master_json, template_reference=template_reference)
+
+    async def fake_frontend(master_json, markdown_spec, existing_bundle=None, change_request=None, template_reference=None):
+        return build_template_driven_frontend_bundle(master_json, template_reference=template_reference)
+
+    async def fake_backend(master_json, markdown_spec, existing_bundle=None, change_request=None, template_reference=None):
+        return {
+            "files": [{"path": "main.py", "language": "python", "content": "app = 'same'"}],
+            "dependencies": {"fastapi": ">=0.100.0"},
+        }
+
+    monkeypatch.setattr(services, "frontend_generator", fake_frontend)
+    monkeypatch.setattr(services, "backend_generator", fake_backend)
+
+    frontend_bundle, _ = asyncio.run(
+        services.generate_code_bundles(
+            revised_master_json,
+            "# spec",
+            existing_frontend_bundle=existing_frontend_bundle,
+            existing_backend_bundle={
+                "files": [{"path": "main.py", "language": "python", "content": "app = 'same'"}],
+                "dependencies": {"fastapi": ">=0.100.0"},
+            },
+            change_request="change the erp into full red colour i want it completely red no other colour",
+            template_reference=template_reference,
+        )
+    )
+
+    file_map = {file["path"]: file["content"] for file in frontend_bundle["files"]}
+    assert "#DC2626" in file_map["src/styles/template.css"]
+    assert '"primary_color": "#DC2626"' in file_map["src/data/schema.js"]
+    assert '"accent_cyan": "#EF4444"' in file_map["src/data/schema.js"]
+
+
+def test_generate_code_bundles_falls_back_to_template_frontend_for_ui_revisions(monkeypatch):
+    template_reference = {
+        "id": "template_1",
+        "name": "Template 1",
+        "display_name": "Template 1 - Athena",
+        "reference_project": "Athena",
+        "status": "ready",
+        "summary": "Command center layout.",
+        "has_actionable_content": True,
+        "design_cues": {
+            "project": "Athena",
+            "theme": {
+                "palette": {
+                    "primary": "#123456",
+                    "secondary": "#654321",
+                    "background": "#0B1220",
+                    "surface": "#111827",
+                    "text": {"primary": "#F8FAFC", "secondary": "#CBD5E1"},
+                    "border": "#1E293B",
+                }
+            },
+            "layout": {"navigation": "sidebar", "density": "comfortable"},
+            "components": {"sidebar": {"width": "260px"}},
+        },
+    }
+    base_master_json = attach_erp_ui_template_metadata(
+        {
+            "system": {"name": "Template ERP", "description": "Generated ERP"},
+            "modules": [{"id": "sales", "name": "Sales", "entities": [], "workflows": [], "endpoints": []}],
+            "documentation": {},
+        },
+        template_reference,
+    )
+    revised_master_json = services._apply_ui_revision_directives(
+        {
+            "system": base_master_json["system"],
+            "modules": base_master_json["modules"],
+            "documentation": dict(base_master_json.get("documentation") or {}),
+        },
+        "change the erp into full red colour i want it completely red no other colour",
+    )
+    existing_frontend_bundle = build_template_driven_frontend_bundle(base_master_json, template_reference=template_reference)
+
+    async def fake_frontend(master_json, markdown_spec, existing_bundle=None, change_request=None, template_reference=None):
+        return existing_bundle
+
+    async def fake_backend(master_json, markdown_spec, existing_bundle=None, change_request=None, template_reference=None):
+        return {
+            "files": [{"path": "main.py", "language": "python", "content": "app = 'same'"}],
+            "dependencies": {"fastapi": ">=0.100.0"},
+        }
+
+    monkeypatch.setattr(services, "frontend_generator", fake_frontend)
+    monkeypatch.setattr(services, "backend_generator", fake_backend)
+
+    frontend_bundle, backend_bundle = asyncio.run(
+        services.generate_code_bundles(
+            revised_master_json,
+            "# spec",
+            existing_frontend_bundle=existing_frontend_bundle,
+            existing_backend_bundle={
+                "files": [{"path": "main.py", "language": "python", "content": "app = 'same'"}],
+                "dependencies": {"fastapi": ">=0.100.0"},
+            },
+            change_request="change the erp into full red colour i want it completely red no other colour",
+            template_reference=template_reference,
+        )
+    )
+
+    file_map = {file["path"]: file["content"] for file in frontend_bundle["files"]}
+    assert "#DC2626" in file_map["src/styles/template.css"]
+    assert '"primary_color": "#DC2626"' in file_map["src/data/schema.js"]
+    assert backend_bundle["files"][0]["content"] == "app = 'same'"
+
+
+def test_generate_code_bundles_short_circuits_ui_only_revisions(monkeypatch):
+    template_reference = {
+        "id": "template_1",
+        "name": "Template 1",
+        "display_name": "Template 1 - Athena",
+        "reference_project": "Athena",
+        "status": "ready",
+        "summary": "Command center layout.",
+        "has_actionable_content": True,
+        "design_cues": {
+            "project": "Athena",
+            "theme": {
+                "palette": {
+                    "primary": "#123456",
+                    "secondary": "#654321",
+                    "background": "#0B1220",
+                    "surface": "#111827",
+                    "text": {"primary": "#F8FAFC", "secondary": "#CBD5E1"},
+                    "border": "#1E293B",
+                }
+            },
+            "layout": {"navigation": "sidebar", "density": "comfortable"},
+            "components": {"sidebar": {"width": "260px"}},
+        },
+    }
+    base_master_json = attach_erp_ui_template_metadata(
+        {
+            "system": {"name": "Template ERP", "description": "Generated ERP"},
+            "modules": [{"id": "sales", "name": "Sales", "entities": [], "workflows": [], "endpoints": []}],
+            "documentation": {},
+        },
+        template_reference,
+    )
+    revised_master_json = services._apply_ui_revision_directives(
+        {
+            "system": base_master_json["system"],
+            "modules": base_master_json["modules"],
+            "documentation": dict(base_master_json.get("documentation") or {}),
+        },
+        "change the erp into full red colour i want it completely red no other colour",
+    )
+    existing_frontend_bundle = build_template_driven_frontend_bundle(base_master_json, template_reference=template_reference)
+    existing_backend_bundle = {
+        "files": [{"path": "main.py", "language": "python", "content": "app = 'same'"}],
+        "dependencies": {"fastapi": ">=0.100.0"},
+    }
+
+    async def fail_frontend(*args, **kwargs):
+        raise AssertionError("frontend generator should not run for UI-only revisions")
+
+    async def fail_backend(*args, **kwargs):
+        raise AssertionError("backend generator should not run for UI-only revisions")
+
+    monkeypatch.setattr(services, "frontend_generator", fail_frontend)
+    monkeypatch.setattr(services, "backend_generator", fail_backend)
+
+    frontend_bundle, backend_bundle = asyncio.run(
+        services.generate_code_bundles(
+            revised_master_json,
+            "# spec",
+            existing_frontend_bundle=existing_frontend_bundle,
+            existing_backend_bundle=existing_backend_bundle,
+            change_request="change the erp into full red colour i want it completely red no other colour",
+            template_reference=template_reference,
+        )
+    )
+
+    file_map = {file["path"]: file["content"] for file in frontend_bundle["files"]}
+    assert "#DC2626" in file_map["src/styles/template.css"]
+    assert backend_bundle["files"][0]["content"] == "app = 'same'"
+
+
 def test_invoke_markdown_blueprint_generator_passes_revision_context_when_supported():
     captured = {}
 
@@ -290,16 +694,18 @@ def test_attach_erp_ui_template_metadata_records_usage_directive():
     enriched = attach_erp_ui_template_metadata(
         {"version": "1.0.0", "system": {"name": "ERP"}},
         {
+            "id": "template_1",
             "name": "Template 1",
+            "display_name": "Template 1 - Athena",
+            "reference_project": "Athena",
             "status": "ready",
             "relative_directory": "Template/Template 1",
-            "json_relative_path": "Template/Template 1/Json1.json",
-            "markdown_relative_path": "Template/Template 1/Md1.md",
-            "has_json_content": True,
-            "has_markdown_content": True,
+            "source_file_paths": [
+                "Template/Template 1/style.css",
+                "Template/Template 1/templates.ts",
+            ],
             "has_actionable_content": True,
-            "json_sha256": "json-hash",
-            "markdown_sha256": "md-hash",
+            "source_sha256": "source-hash",
             "summary": "A shared ERP shell",
             "design_cues": {"layout": {"navigation": "sidebar"}},
             "warnings": [],
@@ -308,7 +714,9 @@ def test_attach_erp_ui_template_metadata_records_usage_directive():
 
     template_metadata = enriched["documentation"]["erp_ui_template"]
     assert template_metadata["name"] == "Template 1"
+    assert template_metadata["reference_project"] == "Athena"
     assert template_metadata["design_cues"]["layout"]["navigation"] == "sidebar"
+    assert template_metadata["source_file_paths"][0] == "Template/Template 1/style.css"
     assert "Do not use it to restyle the AI ERP Builder product UI" in template_metadata["usage_directive"]
 
 
@@ -332,6 +740,71 @@ def test_reset_generation_stages_can_preserve_existing_outputs_for_revisions():
     assert project.pipeline_state["architecture"]["output"]["system_name"] == "ERP"
     assert project.pipeline_state["json_transform"]["output"]["version"] == "1.0.0"
     assert project.pipeline_state["frontend_generation"]["output"]["files"][0]["path"] == "src/App.jsx"
+
+
+def test_apply_generation_failure_state_preserves_last_working_build_for_revision_failures():
+    pipeline_state = services.default_pipeline_state()
+    pipeline_state["frontend_generation"]["status"] = "running"
+    pipeline_state["backend_generation"]["status"] = "running"
+    project = SimpleNamespace(
+        status="GENERATING_FRONTEND",
+        lifecycle_state="revision_running",
+        current_project_version_id="version-7",
+        pipeline_state=pipeline_state,
+        updated_at=None,
+        name="ERP Project",
+    )
+    job = SimpleNamespace(
+        status="running",
+        current_stage="frontend_generation",
+        error_message=None,
+        completed_at=None,
+    )
+
+    failure_state = services._apply_generation_failure_state(
+        project,
+        job,
+        "Revision request completed without changing either the frontend or backend generated code.",
+        change_request="change the erp into full red colour",
+    )
+
+    assert project.status == "COMPLETE"
+    assert project.lifecycle_state == "generated"
+    assert job.status == "failed"
+    assert failure_state["preserved_last_build"] is True
+    assert "last working ERP version is still available" in failure_state["message"]
+    assert project.pipeline_state["frontend_generation"]["status"] == "failed"
+    assert project.pipeline_state["backend_generation"]["status"] == "failed"
+
+
+def test_apply_generation_failure_state_marks_project_error_without_stable_version():
+    project = SimpleNamespace(
+        status="GENERATING_FRONTEND",
+        lifecycle_state="generation_running",
+        current_project_version_id=None,
+        pipeline_state=services.default_pipeline_state(),
+        updated_at=None,
+        name="ERP Project",
+    )
+    job = SimpleNamespace(
+        status="running",
+        current_stage="frontend_generation",
+        error_message=None,
+        completed_at=None,
+    )
+
+    failure_state = services._apply_generation_failure_state(
+        project,
+        job,
+        "Frontend generation failed",
+        change_request=None,
+    )
+
+    assert project.status == "ERROR"
+    assert project.lifecycle_state == "error"
+    assert job.status == "failed"
+    assert failure_state["preserved_last_build"] is False
+    assert failure_state["notification_title"] == "Generation failed"
 
 
 def test_hydrate_pipeline_outputs_from_current_version_backfills_missing_stage_outputs():

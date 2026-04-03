@@ -2846,12 +2846,16 @@ def _fallback_markdown_blueprint(project_name, conversation_transcript, requirem
             "The generated ERP frontend should follow the external template reference instead of inventing a new design language. "
             "This applies only to ERP apps generated from prompts, not to the AI ERP Builder interface itself."
         ),
-        f"- Template Name: {template_metadata.get('name', 'Template 1')}",
+        f"- Template Name: {template_metadata.get('display_name') or template_metadata.get('name', 'Template 1')}",
+        f"- Reference Project: {template_metadata.get('reference_project', 'Unknown')}",
         f"- Template Status: {template_metadata.get('status', 'unknown')}",
         f"- Template Directory: {template_metadata.get('relative_directory', 'Template/Template 1')}",
-        f"- Template JSON: {template_metadata.get('json_relative_path', 'Template/Template 1/Json1.json')}",
-        f"- Template Markdown: {template_metadata.get('markdown_relative_path', 'Template/Template 1/Md1.md')}",
-        f"- Template Summary: {template_metadata.get('summary') or 'No markdown summary was detected.'}",
+        (
+            f"- Source Files: {', '.join(template_metadata.get('source_file_paths') or [])}"
+            if template_metadata.get("source_file_paths")
+            else "- Source Files: No source files were recorded."
+        ),
+        f"- Template Summary: {template_metadata.get('summary') or 'No template summary was detected.'}",
         "",
         "## Module Breakdown",
     ]
@@ -3044,8 +3048,8 @@ async def markdown_blueprint_generator(
 
     template_context = format_erp_ui_template_prompt_context(
         template_reference,
-        json_char_limit=4500,
-        markdown_char_limit=4500,
+        design_char_limit=4500,
+        source_char_limit=4500,
     )
 
     system_prompt = dedent(
@@ -3115,7 +3119,7 @@ async def frontend_generator(
     change_request=None,
     template_reference=None,
 ):
-    if template_reference and template_reference.get("has_actionable_content"):
+    if template_reference and template_reference.get("has_actionable_content") and not (existing_bundle or change_request):
         return build_template_driven_frontend_bundle(master_json, template_reference=template_reference)
 
     revision_text = ""
@@ -3131,8 +3135,8 @@ async def frontend_generator(
 
     template_context = format_erp_ui_template_prompt_context(
         template_reference,
-        json_char_limit=5000,
-        markdown_char_limit=5000,
+        design_char_limit=5000,
+        source_char_limit=5000,
     )
 
     system_prompt = revision_text + """You are a Frontend Code Generator. Generate a deployable React + Tailwind ERP frontend from the ERP JSON schema and Markdown implementation guide.

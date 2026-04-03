@@ -132,9 +132,13 @@ def _normalize_profile(
     modules: list[dict[str, Any]],
     template_reference: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    raw = template_reference.get("json_data") if isinstance(template_reference, dict) else {}
+    raw = {}
+    if isinstance(template_reference, dict):
+        raw = template_reference.get("design_cues") or {}
     raw = raw if isinstance(raw, dict) else {}
     metadata = dict((master_json.get("documentation") or {}).get("erp_ui_template") or {})
+    revision_directives = dict((master_json.get("documentation") or {}).get("ui_revision_directives") or {})
+    theme_overrides = revision_directives.get("theme") if isinstance(revision_directives.get("theme"), dict) else {}
 
     palette = _first(
         _lookup(raw, ("theme", "palette")),
@@ -149,6 +153,7 @@ def _normalize_profile(
 
     layout_mode = str(
         _first(
+            revision_directives.get("layout_mode"),
             _lookup(raw, ("layout", "navigation")),
             _lookup(raw, ("layout", "mode")),
             _lookup(raw, ("navigation", "type")),
@@ -177,8 +182,14 @@ def _normalize_profile(
             kpi_statuses.append(str(item.get("status") or "neutral").lower())
 
     def _kpi_status(index: int, fallback: str) -> str:
-        if index < len(kpi_statuses) and kpi_statuses[index] in {"positive", "negative", "neutral"}:
-            return kpi_statuses[index]
+        if index < len(kpi_statuses):
+            status = kpi_statuses[index]
+            if status in {"positive", "good", "active"}:
+                return "positive"
+            if status in {"negative", "alert", "danger"}:
+                return "negative"
+            if status in {"neutral", "muted"}:
+                return "neutral"
         return fallback
 
     chart_config = _lookup(raw, ("components", "main_chart"))
@@ -217,12 +228,25 @@ def _normalize_profile(
         )
 
     return {
-        "name": metadata.get("name") or (template_reference or {}).get("name") or "Template 1",
+        "name": (
+            metadata.get("display_name")
+            or metadata.get("name")
+            or (template_reference or {}).get("display_name")
+            or (template_reference or {}).get("name")
+            or "Template 1"
+        ),
         "status": metadata.get("status") or (template_reference or {}).get("status") or "unknown",
         "summary": metadata.get("summary") or (template_reference or {}).get("summary") or "",
-        "reference_project": str(_first(raw.get("project"), "Finance Analytics Dashboard")),
+        "reference_project": str(
+            _first(
+                metadata.get("reference_project"),
+                (template_reference or {}).get("reference_project"),
+                raw.get("project"),
+                "ERP Reference",
+            )
+        ),
         "layout_mode": layout_mode,
-        "density": str(_first(_lookup(raw, ("layout", "density")), "comfortable")).lower(),
+        "density": str(_first(revision_directives.get("density"), _lookup(raw, ("layout", "density")), "comfortable")).lower(),
         "hero_kicker": _first(_lookup(raw, ("branding", "kicker")), raw.get("project"), "ERP Control Room"),
         "hero_title": _first(
             _lookup(raw, ("branding", "hero_title")),
@@ -236,23 +260,46 @@ def _normalize_profile(
             metadata.get("summary"),
             "Operate the generated ERP from a template-driven shell that mirrors the saved design reference.",
         ),
-        "primary_color": str(_first(palette.get("primary"), "#3B82F6")),
-        "accent_color": str(_first(palette.get("secondary"), palette.get("accent"), "#A855F7")),
-        "accent_cyan": str(_first(palette.get("accent_cyan"), "#06B6D4")),
-        "background_color": str(_first(palette.get("background"), "#0B0E14")),
-        "surface_color": str(_first(palette.get("surface"), "#161B22")),
-        "text_color": str(_first(text_palette.get("primary"), palette.get("text"), "#FFFFFF")),
-        "muted_color": str(_first(text_palette.get("secondary"), palette.get("muted"), "#8B949E")),
+        "primary_color": str(_first(theme_overrides.get("primary_color"), palette.get("primary"), "#3B82F6")),
+        "accent_color": str(_first(theme_overrides.get("accent_color"), palette.get("secondary"), palette.get("accent"), "#A855F7")),
+        "accent_cyan": str(
+            _first(
+                theme_overrides.get("accent_cyan"),
+                palette.get("accent_cyan"),
+                theme_overrides.get("accent_color"),
+                palette.get("accent"),
+                palette.get("secondary"),
+                "#06B6D4",
+            )
+        ),
+        "background_color": str(_first(theme_overrides.get("background_color"), palette.get("background"), "#0B0E14")),
+        "surface_color": str(_first(theme_overrides.get("surface_color"), palette.get("surface"), "#161B22")),
+        "text_color": str(
+            _first(
+                theme_overrides.get("text_color"),
+                text_palette.get("primary"),
+                palette.get("text"),
+                "#FFFFFF",
+            )
+        ),
+        "muted_color": str(
+            _first(
+                theme_overrides.get("muted_color"),
+                text_palette.get("secondary"),
+                palette.get("muted"),
+                "#8B949E",
+            )
+        ),
         "disabled_color": str(_first(text_palette.get("disabled"), "#484F58")),
-        "border_color": str(_first(palette.get("border"), "#21262D")),
-        "success_color": str(_first(palette.get("success"), "#10B981")),
-        "danger_color": str(_first(palette.get("danger"), "#EF4444")),
+        "border_color": str(_first(theme_overrides.get("border_color"), palette.get("border"), "#21262D")),
+        "success_color": str(_first(theme_overrides.get("success_color"), palette.get("success"), "#10B981")),
+        "danger_color": str(_first(theme_overrides.get("danger_color"), palette.get("danger"), "#EF4444")),
         "font_heading": str(_first(_lookup(raw, ("typography", "heading")), "'Inter', 'Segoe UI', sans-serif")),
         "font_body": str(_first(_lookup(raw, ("typography", "body")), "'Inter', 'Segoe UI', sans-serif")),
         "container_padding": str(_first(spacing.get("container_padding"), "32px")),
         "card_gap": str(_first(spacing.get("card_gap"), "24px")),
-        "border_radius": str(_first(spacing.get("border_radius"), "12px")),
-        "sidebar_width": str(_first(_lookup(raw, ("components", "sidebar", "width")), "260px")),
+        "border_radius": str(_first(revision_directives.get("border_radius"), spacing.get("border_radius"), "12px")),
+        "sidebar_width": str(_first(revision_directives.get("sidebar_width"), _lookup(raw, ("components", "sidebar", "width")), "260px")),
         "sidebar_items": [
             str(item)
             for item in (_lookup(raw, ("components", "sidebar", "items")) or [])

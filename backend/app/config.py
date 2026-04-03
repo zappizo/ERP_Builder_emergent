@@ -56,9 +56,8 @@ class Settings(BaseSettings):
     openrouter_site_url: str = Field(default="http://127.0.0.1:3001", alias="OPENROUTER_SITE_URL")
     openrouter_app_name: str = Field(default="AI ERP Builder", alias="OPENROUTER_APP_NAME")
     enable_interviewer_llm: bool = Field(default=True, alias="ENABLE_INTERVIEWER_LLM")
-    generated_erp_template_dir: str = Field(default="Template/Template 1", alias="GENERATED_ERP_TEMPLATE_DIR")
-    generated_erp_template_json_file: str = Field(default="Json1.json", alias="GENERATED_ERP_TEMPLATE_JSON_FILE")
-    generated_erp_template_markdown_file: str = Field(default="Md1.md", alias="GENERATED_ERP_TEMPLATE_MARKDOWN_FILE")
+    generated_erp_templates_dir: str = Field(default="Template", alias="GENERATED_ERP_TEMPLATES_DIR")
+    generated_erp_default_template_id: str = Field(default="template_1", alias="GENERATED_ERP_DEFAULT_TEMPLATE_ID")
 
     @property
     def cors_origins(self) -> list[str]:

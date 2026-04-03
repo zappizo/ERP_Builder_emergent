@@ -120,9 +120,17 @@ export default function ProjectBuilder() {
           <div className="w-5 h-5 bg-[var(--zap-accent)] rounded-sm flex items-center justify-center">
             <Zap className="w-3 h-3 text-white" />
           </div>
-          <span className="text-sm font-bold tracking-tight" style={{ fontFamily: 'var(--font-heading)' }}>
-            {project.name}
-          </span>
+          <div className="flex flex-col">
+            <span className="text-sm font-bold tracking-tight" style={{ fontFamily: 'var(--font-heading)' }}>
+              {project.name}
+            </span>
+            {project.selected_template_name && (
+              <span className="text-[11px] text-[var(--zap-text-muted)]">
+                {project.selected_template_name}
+                {project.selected_template_reference ? ` • ${project.selected_template_reference}` : ""}
+              </span>
+            )}
+          </div>
         </div>
         <div className="flex-1 mx-4">
           <PipelineProgress pipeline={project.pipeline} status={project.status} />

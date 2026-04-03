@@ -25,8 +25,17 @@ function resolveBackendUrl() {
 const backendUrl = resolveBackendUrl();
 const API = backendUrl ? `${backendUrl}/api` : "/api";
 
-export async function createProject(name, prompt) {
-  const { data } = await axios.post(`${API}/projects`, { name, prompt }, { timeout: 12000 });
+export async function createProject(name, prompt, templateId) {
+  const payload = { name, prompt };
+  if (templateId) {
+    payload.template_id = templateId;
+  }
+  const { data } = await axios.post(`${API}/projects`, payload, { timeout: 12000 });
+  return data;
+}
+
+export async function listProjectTemplates() {
+  const { data } = await axios.get(`${API}/projects/templates`, { timeout: 10000 });
   return data;
 }
 

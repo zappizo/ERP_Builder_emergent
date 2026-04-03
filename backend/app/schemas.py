@@ -52,6 +52,7 @@ class ProjectCreateRequest(BaseModel):
     name: str = Field(min_length=2, max_length=255)
     prompt: str = Field(min_length=10)
     description: str | None = None
+    template_id: str | None = None
 
 
 class PromptRead(ORMModel):
@@ -91,6 +92,9 @@ class ProjectRead(ORMModel):
     name: str
     description: str | None = None
     prompt: str = Field(validation_alias="prompt_text")
+    selected_template_id: str | None = None
+    selected_template_name: str | None = None
+    selected_template_reference: str | None = None
     status: str
     lifecycle_state: str
     requirement_completeness: float
@@ -204,6 +208,23 @@ class DeploymentLogRead(ORMModel):
     level: str
     message: str
     created_at: datetime
+
+
+class TemplateSourceFileRead(BaseModel):
+    relative_path: str
+    language: str = "text"
+    role: str | None = None
+
+
+class ErpTemplateRead(BaseModel):
+    id: str
+    name: str
+    display_name: str
+    reference_project: str
+    summary: str = ""
+    relative_directory: str
+    status: str = "ready"
+    source_files: list[TemplateSourceFileRead] = Field(default_factory=list)
 
 
 class APIConfigurationUpsertRequest(BaseModel):

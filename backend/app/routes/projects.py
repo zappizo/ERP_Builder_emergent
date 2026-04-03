@@ -12,6 +12,7 @@ from ..schemas import (
     BlueprintVersionRead,
     ChatRequest,
     ChatResponse,
+    ErpTemplateRead,
     GenerationJobRead,
     LocalRunRead,
     MessageRead,
@@ -36,6 +37,7 @@ from ..services import (
     list_project_prompts,
     list_project_versions,
     list_projects,
+    list_available_project_templates,
     run_project_locally,
     serialize_project,
     soft_delete_project,
@@ -78,6 +80,13 @@ def list_projects_endpoint(
 ) -> list[dict[str, Any]]:
     projects = list_projects(db, user)
     return [_project_payload(project, list_view=True) for project in projects]
+
+
+@router.get("/templates", response_model=list[ErpTemplateRead])
+def list_templates_endpoint(
+    user: User = Depends(ensure_active_user),
+) -> list[ErpTemplateRead]:
+    return [ErpTemplateRead.model_validate(item) for item in list_available_project_templates()]
 
 
 @router.get("/{project_id}")

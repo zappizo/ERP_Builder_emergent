@@ -10,6 +10,7 @@ from .routes.auth import router as auth_router
 from .routes.platform import router as platform_router
 from .routes.projects import router as projects_router
 from .schemas import StatusResponse
+from .services import recover_interrupted_generation_jobs
 
 
 settings = get_settings()
@@ -48,3 +49,4 @@ def startup() -> None:
     if not settings.auth_required:
         with SessionLocal() as db:
             get_or_create_bootstrap_user(db)
+            recover_interrupted_generation_jobs(db)
