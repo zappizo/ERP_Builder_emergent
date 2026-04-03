@@ -116,6 +116,11 @@ class ChatResponse(BaseModel):
     requirements: dict[str, Any] | None = None
     current_module: str | None = None
     progress: str | None = None
+    completeness_score: float | None = None
+    missing_topics: list[str] = Field(default_factory=list)
+    captured_topics: list[str] = Field(default_factory=list)
+    question_rationale: str | None = None
+    analysis_model: str | None = None
 
 
 class GenerationTriggerRequest(BaseModel):
@@ -290,9 +295,14 @@ class RequirementsDocumentPayload(BaseModel):
 
 class GatheringPayload(BaseModel):
     complete: bool = False
+    assistant_response: str | None = None
     question: str | None = None
     current_module: str | None = None
     progress_summary: str | None = None
+    completeness_score: float | None = None
+    missing_topics: list[str] = Field(default_factory=list)
+    captured_topics: list[str] = Field(default_factory=list)
+    question_rationale: str | None = None
     requirements: RequirementsDocumentPayload | None = None
 
     model_config = ConfigDict(extra="allow")

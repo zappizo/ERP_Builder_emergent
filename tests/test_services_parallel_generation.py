@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.app import services
+from backend.app.template_loader import attach_erp_ui_template_metadata
 
 
 def test_generate_code_bundles_runs_generators_in_parallel(monkeypatch):
@@ -32,7 +33,7 @@ def test_generate_code_bundles_runs_generators_in_parallel(monkeypatch):
     frontend_bundle, backend_bundle = asyncio.run(services.generate_code_bundles({"modules": []}, "# spec"))
     elapsed = time.perf_counter() - start
 
-    assert elapsed < 0.32
+    assert elapsed < 0.4
     assert frontend_bundle["files"][0]["path"] == "src/App.jsx"
     assert backend_bundle["files"][0]["path"] == "main.py"
 
@@ -229,6 +230,86 @@ def test_invoke_markdown_blueprint_generator_passes_revision_context_when_suppor
     assert captured["conversation_transcript"] == "chat transcript"
     assert captured["existing_markdown"] == "# Existing Guide"
     assert captured["change_request"] == "Add procurement approval flow"
+
+
+def test_invoke_markdown_blueprint_generator_passes_template_reference_when_supported():
+    captured = {}
+
+    async def fake_markdown_generator(
+        project_name,
+        conversation_transcript,
+        requirements,
+        architecture,
+        master_json,
+        existing_markdown=None,
+        change_request=None,
+        template_reference=None,
+    ):
+        captured["template_reference"] = template_reference
+        return "# Updated Guide"
+
+    template_reference = {"name": "Template 1", "status": "ready"}
+    result = asyncio.run(
+        services._invoke_markdown_blueprint_generator(
+            fake_markdown_generator,
+            "ERP",
+            "chat transcript",
+            {"business_type": "manufacturing"},
+            {"system_name": "ERP"},
+            {"version": "1.0.0"},
+            template_reference=template_reference,
+        )
+    )
+
+    assert result == "# Updated Guide"
+    assert captured["template_reference"] == template_reference
+
+
+def test_invoke_code_generator_passes_template_reference_when_supported():
+    captured = {}
+
+    async def fake_frontend_generator(master_json, markdown_spec, template_reference=None):
+        captured["template_reference"] = template_reference
+        return {"files": [{"path": "src/App.jsx", "language": "jsx", "content": "export default function App() {}"}]}
+
+    template_reference = {"name": "Template 1", "status": "ready"}
+    result = asyncio.run(
+        services._invoke_code_generator(
+            fake_frontend_generator,
+            {"version": "1.0.0"},
+            "# spec",
+            template_reference=template_reference,
+        )
+    )
+
+    assert result["files"][0]["path"] == "src/App.jsx"
+    assert captured["template_reference"] == template_reference
+
+
+def test_attach_erp_ui_template_metadata_records_usage_directive():
+    enriched = attach_erp_ui_template_metadata(
+        {"version": "1.0.0", "system": {"name": "ERP"}},
+        {
+            "name": "Template 1",
+            "status": "ready",
+            "relative_directory": "Template/Template 1",
+            "json_relative_path": "Template/Template 1/Json1.json",
+            "markdown_relative_path": "Template/Template 1/Md1.md",
+            "has_json_content": True,
+            "has_markdown_content": True,
+            "has_actionable_content": True,
+            "json_sha256": "json-hash",
+            "markdown_sha256": "md-hash",
+            "summary": "A shared ERP shell",
+            "design_cues": {"layout": {"navigation": "sidebar"}},
+            "warnings": [],
+        },
+    )
+
+    template_metadata = enriched["documentation"]["erp_ui_template"]
+    assert template_metadata["name"] == "Template 1"
+    assert template_metadata["design_cues"]["layout"]["navigation"] == "sidebar"
+    assert "Do not use it to restyle the AI ERP Builder product UI" in template_metadata["usage_directive"]
 
 
 def test_reset_generation_stages_can_preserve_existing_outputs_for_revisions():

@@ -53,6 +53,44 @@ def _merge_files(scaffold_files: list[dict[str, Any]], generated_files: list[dic
     return list(file_map.values())
 
 
+def _normalize_python_package_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    file_map: dict[str, dict[str, Any]] = {
+        str(entry.get("path") or "").strip().replace("\\", "/"): {
+            "path": str(entry.get("path") or "").strip().replace("\\", "/"),
+            "language": entry.get("language") or "text",
+            "content": str(entry.get("content") or ""),
+        }
+        for entry in files
+        if str(entry.get("path") or "").strip()
+    }
+
+    package_dirs: set[str] = set()
+    for path in list(file_map):
+        if not path.endswith(".py") or "/" not in path:
+            continue
+        parent_parts = path.split("/")[:-1]
+        for depth in range(1, len(parent_parts) + 1):
+            package_dirs.add("/".join(parent_parts[:depth]))
+
+    for package_dir in sorted(package_dirs, key=lambda value: (value.count("/"), value)):
+        module_path = f"{package_dir}.py"
+        init_path = f"{package_dir}/__init__.py"
+        if module_path in file_map:
+            module_entry = file_map.pop(module_path)
+            if init_path in file_map:
+                existing = file_map[init_path]["content"].rstrip()
+                incoming = module_entry["content"].strip()
+                if incoming and incoming not in existing:
+                    merged = f"{existing}\n\n{incoming}".strip()
+                    file_map[init_path] = {**file_map[init_path], "content": f"{merged}\n"}
+            else:
+                file_map[init_path] = {**module_entry, "path": init_path}
+        elif init_path not in file_map:
+            file_map[init_path] = {"path": init_path, "language": "python", "content": ""}
+
+    return list(file_map.values())
+
+
 def _patch_backend_database_file(content: str) -> str:
     return """from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -96,7 +134,12 @@ def _patch_backend_main_file(content: str) -> str:
         match = re.match(r"^from\s+([A-Za-z0-9_\.]+)\s+import\s+(.+)$", stripped)
         if match:
             module_name = match.group(1)
-            route_like_import = module_name == "routes" or module_name.endswith(".routes")
+            route_like_import = (
+                module_name == "routes"
+                or module_name.startswith("routes.")
+                or module_name.endswith(".routes")
+                or ".routes." in module_name
+            )
             imported_specs = [name.strip() for name in match.group(2).split(",") if name.strip()]
             parsed_specs: list[tuple[str, str]] = []
             for imported_spec in imported_specs:
@@ -498,7 +541,7 @@ def _build_backend_runtime_files(
         },
     ]
 
-    merged_files = _merge_files(scaffold_files, generated_files)
+    merged_files = _normalize_python_package_files(_merge_files(scaffold_files, generated_files))
     patched_files = []
     for entry in merged_files:
         if entry["path"] == "database.py":
@@ -604,6 +647,26 @@ def _reset_runtime_directory(path: Path, preserve_names: set[str]) -> None:
         else:
             try:
                 child.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _remove_shadowing_package_modules(base_path: Path, files: list[dict[str, Any]]) -> None:
+    desired_paths = {
+        str(entry.get("path") or "").strip().replace("\\", "/")
+        for entry in files
+        if str(entry.get("path") or "").strip()
+    }
+    package_dirs = {
+        str(Path(path).parent).replace("\\", "/")
+        for path in desired_paths
+        if path.endswith("/__init__.py")
+    }
+    for package_dir in package_dirs:
+        module_path = base_path / Path(f"{package_dir}.py")
+        if module_path.exists() and f"{package_dir}.py" not in desired_paths:
+            try:
+                module_path.unlink()
             except FileNotFoundError:
                 pass
 
@@ -826,6 +889,8 @@ def start_project_locally(db: Session, project: Project) -> dict[str, Any]:
         )
         _reset_runtime_directory(spec_dir, set())
         time.sleep(2)
+    _remove_shadowing_package_modules(frontend_dir, bundle["frontend_files"])
+    _remove_shadowing_package_modules(backend_dir, bundle["backend_files"])
     _write_files(frontend_dir, bundle["frontend_files"])
     _write_files(backend_dir, bundle["backend_files"])
     _write_files(spec_dir, bundle["spec_files"])

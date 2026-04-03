@@ -138,6 +138,9 @@ export default function ProjectBuilder() {
             onSend={handleSend}
             isLoading={chatLoading}
             projectStatus={project.status}
+            analysisStage={project.pipeline?.requirement_analysis?.output}
+            requirementStage={project.pipeline?.requirement_gathering?.output}
+            requirementCompleteness={project.requirement_completeness}
           />
         </div>
 

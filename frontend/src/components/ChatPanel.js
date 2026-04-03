@@ -14,14 +14,14 @@ const STAGE_DETAILS = {
   ANALYZING: {
     title: "Requirement analysis",
     summary: "The app is reading your prompt and inferring the business type, scale, modules, and missing details.",
-    model: "deepseek/deepseek-r1-distill-llama-70b",
+    model: "Configured analysis model",
     api: "OpenRouter /api/v1/chat/completions",
     action: "The UI is polling /api/projects/{id} and /api/projects/{id}/messages.",
   },
   GATHERING: {
     title: "Clarifying requirements",
     summary: "The planner is asking focused follow-up questions before it locks the final ERP requirements.",
-    model: "deepseek/deepseek-r1-distill-llama-70b",
+    model: "Configured analysis model",
     api: "OpenRouter /api/v1/chat/completions via POST /api/projects/{id}/chat",
     action: "Reply in the chat box to move the project to architecture and generation.",
   },
@@ -76,6 +76,11 @@ const STAGE_DETAILS = {
   },
 };
 
+function clampPercent(value) {
+  if (typeof value !== "number" || Number.isNaN(value)) return null;
+  return Math.max(0, Math.min(100, Math.round(value * 100)));
+}
+
 function renderMarkdown(text) {
   if (!text) return "";
   return text
@@ -91,12 +96,38 @@ function summarizeMessage(text) {
   return `${normalized.slice(0, 177)}...`;
 }
 
-export default function ChatPanel({ messages, onSend, isLoading, projectStatus }) {
+export default function ChatPanel({
+  messages,
+  onSend,
+  isLoading,
+  projectStatus,
+  analysisStage,
+  requirementStage,
+  requirementCompleteness,
+}) {
   const [input, setInput] = useState("");
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
   const stageInfo = STAGE_DETAILS[projectStatus] || STAGE_DETAILS.INIT;
   const latestAssistantMessage = [...messages].reverse().find((msg) => msg.role === "assistant")?.content;
+  const requirementMeta = requirementStage && typeof requirementStage === "object" ? requirementStage : null;
+  const analysisMeta = analysisStage && typeof analysisStage === "object" ? analysisStage : null;
+  const liveModel = requirementMeta?.analysis_model || stageInfo.model;
+  const liveSummary =
+    (projectStatus === "GATHERING" ? requirementMeta?.progress_summary : null) ||
+    (projectStatus === "ANALYZING" ? analysisMeta?.summary : null) ||
+    (projectStatus === "GATHERING" ? analysisMeta?.summary : null) ||
+    stageInfo.summary;
+  const liveAction = requirementMeta?.question_rationale
+    ? `Next question focus: ${requirementMeta.question_rationale}.`
+    : stageInfo.action;
+  const missingTopics = Array.isArray(requirementMeta?.missing_topics) ? requirementMeta.missing_topics.slice(0, 4) : [];
+  const capturedTopics = Array.isArray(requirementMeta?.captured_topics) ? requirementMeta.captured_topics.slice(0, 4) : [];
+  const discoveryPercent = clampPercent(
+    typeof requirementMeta?.completeness_score === "number"
+      ? requirementMeta.completeness_score
+      : requirementCompleteness,
+  );
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -141,16 +172,43 @@ export default function ChatPanel({ messages, onSend, isLoading, projectStatus }
           </div>
           <div>
             <p className="text-sm font-semibold text-[var(--zap-text-heading)]">{stageInfo.title}</p>
-            <p className="mt-1 text-xs leading-relaxed text-[var(--zap-text-body)]">{stageInfo.summary}</p>
+            <p className="mt-1 text-xs leading-relaxed text-[var(--zap-text-body)]">{liveSummary}</p>
           </div>
           <div className="space-y-1.5 text-xs text-[var(--zap-text-body)]">
-            <p><span className="font-medium text-[var(--zap-text-heading)]">Model:</span> {stageInfo.model}</p>
+            <p><span className="font-medium text-[var(--zap-text-heading)]">Model:</span> {liveModel}</p>
             <p><span className="font-medium text-[var(--zap-text-heading)]">API:</span> {stageInfo.api}</p>
-            <p><span className="font-medium text-[var(--zap-text-heading)]">Next:</span> {stageInfo.action}</p>
+            <p><span className="font-medium text-[var(--zap-text-heading)]">Next:</span> {liveAction}</p>
+            {discoveryPercent !== null && ["ANALYZING", "GATHERING", "COMPLETE"].includes(projectStatus) && (
+              <p><span className="font-medium text-[var(--zap-text-heading)]">Coverage:</span> {discoveryPercent}%</p>
+            )}
             {latestAssistantMessage && (
               <p><span className="font-medium text-[var(--zap-text-heading)]">Latest update:</span> {summarizeMessage(latestAssistantMessage)}</p>
             )}
           </div>
+          {capturedTopics.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 pt-1">
+              {capturedTopics.map((topic) => (
+                <span
+                  key={`captured-${topic}`}
+                  className="rounded-full bg-[var(--zap-accent)]/10 px-2 py-1 text-[10px] font-medium text-[var(--zap-accent)]"
+                >
+                  {topic}
+                </span>
+              ))}
+            </div>
+          )}
+          {missingTopics.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 pt-1">
+              {missingTopics.map((topic) => (
+                <span
+                  key={`missing-${topic}`}
+                  className="rounded-full border border-[var(--zap-border)] px-2 py-1 text-[10px] font-medium text-[var(--zap-text-body)]"
+                >
+                  Need: {topic}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       </div>
 

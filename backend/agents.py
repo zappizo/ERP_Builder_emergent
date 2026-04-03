@@ -9,6 +9,10 @@ from pathlib import Path
 from textwrap import dedent
 
 import requests
+
+from app.functional_backend_bundle import build_functional_backend_bundle
+from app.template_frontend_bundle import build_template_driven_frontend_bundle
+from app.template_loader import format_erp_ui_template_prompt_context
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
@@ -79,6 +83,13 @@ def _resolve_models(model_group):
     if model_group == "code":
         return CODE_MODELS or DEFAULT_MODELS
     return DEFAULT_MODELS
+
+
+def analysis_model_label():
+    models = _resolve_models("analysis")
+    if models:
+        return models[0]
+    return "local heuristic fallback"
 
 INDUSTRY_KEYWORDS = {
     "manufacturing": ["manufacturing", "factory", "production", "assembly", "plant"],
@@ -982,6 +993,37 @@ def _extract_json(text):
     raise ValueError(f"Could not extract JSON from: {text[:300]}")
 
 
+def _bundle_file_paths(bundle):
+    if not isinstance(bundle, dict):
+        return set()
+    return {
+        str(entry.get("path") or "").strip().replace("\\", "/")
+        for entry in bundle.get("files", [])
+        if isinstance(entry, dict) and str(entry.get("path") or "").strip()
+    }
+
+
+def _is_actionable_frontend_bundle(bundle):
+    paths = _bundle_file_paths(bundle)
+    required = {"src/App.jsx", "src/pages/Dashboard.jsx", "src/pages/ModuleWorkspace.jsx"}
+    return required.issubset(paths) and "src/lib/api.js" in paths and len(paths) >= 8
+
+
+def _is_actionable_backend_bundle(bundle):
+    paths = _bundle_file_paths(bundle)
+    required = {
+        "main.py",
+        "database.py",
+        "models.py",
+        "schemas.py",
+        "security.py",
+        "routes/auth.py",
+        "routes/modules.py",
+        "routes/__init__.py",
+    }
+    return required.issubset(paths) and len(paths) >= 10
+
+
 def _stringify_progress_summary(summary):
     if summary is None:
         return None
@@ -1080,6 +1122,293 @@ def _ordered_unique(items):
             ordered.append(item)
             seen.add(item)
     return ordered
+
+
+DISCOVERY_TOPIC_CATALOG = [
+    {
+        "id": "workflows",
+        "label": "workflow steps and approvals",
+        "keywords": [
+            "workflow",
+            "process",
+            "step",
+            "approval",
+            "approve",
+            "review",
+            "stage",
+            "lifecycle",
+            "status",
+            "ticket",
+            "dispatch",
+            "invoice",
+            "order",
+            "appointment",
+            "handoff",
+        ],
+        "question": "For {module_label}, what should happen from intake through review, approval, completion, and follow-up?",
+        "rationale": "the real workflow stages and approval path",
+    },
+    {
+        "id": "records",
+        "label": "records, forms, and essential fields",
+        "keywords": [
+            "customer",
+            "supplier",
+            "patient",
+            "employee",
+            "product",
+            "item",
+            "record",
+            "field",
+            "form",
+            "table",
+            "sku",
+            "invoice no",
+            "po",
+            "serial",
+            "address",
+        ],
+        "question": "What records should {module_label} manage, and which fields are mandatory on the key forms and tables?",
+        "rationale": "the exact data model and UI forms",
+    },
+    {
+        "id": "roles",
+        "label": "roles, RBAC, and permissions",
+        "keywords": [
+            "role",
+            "permission",
+            "access",
+            "rbac",
+            "admin",
+            "manager",
+            "approver",
+            "operator",
+            "staff",
+            "finance",
+            "warehouse",
+            "sales",
+            "hr",
+            "front desk",
+        ],
+        "question": "Which roles will use the ERP, what should each role be allowed to view or change, and where do approvals need role-based control?",
+        "rationale": "the RBAC model and approval ownership",
+    },
+    {
+        "id": "reporting",
+        "label": "dashboards, KPIs, and reports",
+        "keywords": [
+            "dashboard",
+            "kpi",
+            "report",
+            "reports",
+            "analytics",
+            "metric",
+            "summary",
+            "trend",
+            "aging",
+            "statement",
+            "visibility",
+        ],
+        "question": "What dashboards, KPIs, alerts, or reports do you want decision-makers to see day to day?",
+        "rationale": "the operational reporting and dashboard layer",
+    },
+    {
+        "id": "integrations",
+        "label": "integrations, notifications, and automation",
+        "keywords": [
+            "integration",
+            "api",
+            "email",
+            "sms",
+            "whatsapp",
+            "notification",
+            "alert",
+            "webhook",
+            "erp",
+            "n8n",
+            "accounting",
+            "payment",
+            "barcode",
+            "printer",
+            "sync",
+        ],
+        "question": "Which integrations, notifications, or automation flows should the ERP connect to so the generated code matches your real operations?",
+        "rationale": "the external systems and automation hooks",
+    },
+    {
+        "id": "scale",
+        "label": "users, branches, and operational scale",
+        "keywords": [
+            "user",
+            "users",
+            "team",
+            "branch",
+            "location",
+            "warehouse",
+            "clinic",
+            "store",
+            "multi",
+            "volume",
+            "transactions",
+            "orders per day",
+            "concurrent",
+        ],
+        "question": "How many users, branches, or transactions should this ERP support, and are there any multi-location or performance expectations we should design for?",
+        "rationale": "the scale, branch structure, and runtime constraints",
+    },
+    {
+        "id": "exceptions",
+        "label": "exceptions, compliance, and edge cases",
+        "keywords": [
+            "audit",
+            "compliance",
+            "policy",
+            "exception",
+            "edge case",
+            "refund",
+            "return",
+            "rework",
+            "escalation",
+            "sla",
+            "reminder",
+            "penalty",
+            "tracking",
+        ],
+        "question": "Are there any special business rules, audit requirements, exceptions, or edge cases the ERP must enforce so the final code behaves correctly?",
+        "rationale": "the rules and exceptions that change implementation behavior",
+    },
+]
+
+
+def _user_messages(conversation_history):
+    return [
+        str(message.get("content") or "").strip()
+        for message in conversation_history
+        if message.get("role") == "user" and str(message.get("content") or "").strip()
+    ]
+
+
+def _joined_user_messages(conversation_history):
+    return "\n".join(_user_messages(conversation_history))
+
+
+def _normalize_string_list(values):
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        return []
+    cleaned = []
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            cleaned.append(text)
+    return _ordered_unique(cleaned)
+
+
+def _discovery_topic_lookup():
+    return {topic["id"]: topic for topic in DISCOVERY_TOPIC_CATALOG}
+
+
+def _discovery_topic_labels(topic_ids):
+    lookup = _discovery_topic_lookup()
+    labels = []
+    for topic_id in topic_ids:
+        topic = lookup.get(topic_id)
+        if topic:
+            labels.append(topic["label"])
+        else:
+            labels.append(str(topic_id))
+    return _ordered_unique(labels)
+
+
+def _captured_discovery_topics(conversation_history):
+    lowered = _joined_user_messages(conversation_history).lower()
+    captured = []
+    for topic in DISCOVERY_TOPIC_CATALOG:
+        if any(keyword in lowered for keyword in topic["keywords"]):
+            captured.append(topic["id"])
+    return captured
+
+
+def _missing_discovery_topics(analysis, conversation_history):
+    captured = set(_captured_discovery_topics(conversation_history))
+    missing = [topic["id"] for topic in DISCOVERY_TOPIC_CATALOG if topic["id"] not in captured]
+    modules = [str(module or "").strip() for module in analysis.get("suggested_modules", []) if str(module or "").strip()]
+    if not modules and "workflows" in missing:
+        missing.remove("workflows")
+    return missing
+
+
+def _select_follow_up_module(analysis, conversation_history):
+    modules = [str(module or "").strip() for module in analysis.get("suggested_modules", []) if str(module or "").strip()]
+    if not modules:
+        return "Operations"
+
+    lowered = _joined_user_messages(conversation_history).lower()
+    for module in modules:
+        tokens = [token for token in re.split(r"[^a-z0-9]+", module.lower()) if len(token) > 2]
+        if not tokens or not any(token in lowered for token in tokens):
+            return module
+
+    return modules[min(max(len(_user_messages(conversation_history)) - 1, 0), len(modules) - 1)]
+
+
+def _topic_for_follow_up(analysis, conversation_history, missing_topics=None):
+    missing = list(missing_topics or _missing_discovery_topics(analysis, conversation_history))
+    if missing:
+        return missing[0]
+    return DISCOVERY_TOPIC_CATALOG[0]["id"]
+
+
+def _current_module_for_topic(analysis, conversation_history, topic_id):
+    if topic_id in {"roles", "reporting", "integrations", "scale", "exceptions"}:
+        return "Cross-functional"
+    return _select_follow_up_module(analysis, conversation_history)
+
+
+def _build_follow_up_question(analysis, conversation_history, topic_id=None, current_module=None):
+    resolved_topic_id = topic_id or _topic_for_follow_up(analysis, conversation_history)
+    topic = _discovery_topic_lookup().get(resolved_topic_id, DISCOVERY_TOPIC_CATALOG[0])
+    module_name = current_module or _current_module_for_topic(analysis, conversation_history, resolved_topic_id)
+    module_label = "the ERP overall" if module_name == "Cross-functional" else module_name
+    return topic["question"].format(
+        module_label=module_label,
+        business_type=analysis.get("business_type", "business"),
+        industry=analysis.get("industry", "general business"),
+    )
+
+
+def _question_rationale_for_topic(topic_id):
+    topic = _discovery_topic_lookup().get(topic_id)
+    if not topic:
+        return None
+    return topic["rationale"]
+
+
+def _estimate_gathering_score(conversation_history, captured_topics=None, missing_topics=None):
+    user_messages = _user_messages(conversation_history)
+    captured = captured_topics or _captured_discovery_topics(conversation_history)
+    missing = missing_topics if missing_topics is not None else [
+        topic["id"] for topic in DISCOVERY_TOPIC_CATALOG if topic["id"] not in set(captured)
+    ]
+
+    coverage_ratio = len(captured) / max(len(DISCOVERY_TOPIC_CATALOG), 1)
+    score = 0.18 + (coverage_ratio * 0.52) + (min(max(len(user_messages) - 1, 0), 4) * 0.06)
+    if len(user_messages) <= 1:
+        score = min(score, 0.52)
+    elif missing:
+        score = min(score, 0.84)
+    else:
+        score = max(score, 0.9)
+    return round(min(max(score, 0.12), 0.98), 2)
+
+
+def _coerce_score(value, default):
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        score = float(default)
+    return round(min(max(score, 0.0), 1.0), 2)
 
 
 def _infer_modules(text, industry):
@@ -1368,18 +1697,84 @@ def _fallback_requirement_analysis(prompt):
     }
 
 
-def _fallback_progress_summary(analysis, conversation_history):
-    user_messages = [msg["content"] for msg in conversation_history if msg.get("role") == "user"]
+def _infer_reporting_needs(text):
+    lowered = text.lower()
+    needs = []
+    if any(token in lowered for token in ["dashboard", "kpi", "metric", "analytics", "visibility"]):
+        needs.append("Operational dashboards")
+    if "report" in lowered or "reports" in lowered or "statement" in lowered:
+        needs.append("Scheduled and ad hoc reports")
+    if "alert" in lowered or "reminder" in lowered or "notification" in lowered:
+        needs.append("Exceptions and alert monitoring")
+    return _ordered_unique(needs)[:4]
+
+
+def _infer_access_requirements(text):
+    lowered = text.lower()
+    requirements = []
+    if any(token in lowered for token in ["approval", "approve", "review"]):
+        requirements.append("Approval-based workflow controls")
+    if any(token in lowered for token in ["role", "permission", "rbac", "access"]):
+        requirements.append("Granular role-based permissions")
+    if "audit" in lowered or "compliance" in lowered:
+        requirements.append("Audit history for important actions")
+    return _ordered_unique(requirements)[:4]
+
+
+def _target_module_indexes(modules, text):
+    lowered = text.lower()
+    indexes = []
+    for index, module in enumerate(modules):
+        module_name = str(module.get("name") or "").lower()
+        tokens = [token for token in re.split(r"[^a-z0-9]+", module_name) if len(token) > 2]
+        if tokens and any(token in lowered for token in tokens):
+            indexes.append(index)
+    if indexes:
+        return indexes
+    return [0] if modules else []
+
+
+def _augment_requirement_modules(modules, text):
+    lowered = text.lower()
+    targets = _target_module_indexes(modules, text)
+    if not targets:
+        return modules
+
+    for index in targets:
+        module = modules[index]
+        module["features"] = list(module.get("features") or [])
+        module["workflows"] = list(module.get("workflows") or [])
+        module["user_roles"] = list(module.get("user_roles") or [])
+
+        if any(token in lowered for token in ["approval", "approve", "review", "sign off", "sign-off"]):
+            module["features"] = _ordered_unique(module["features"] + ["Approval workflow controls"])
+            module["workflows"] = _ordered_unique(module["workflows"] + ["Approval Flow"])
+            module["user_roles"] = _ordered_unique(module["user_roles"] + ["Operations Manager"])
+        if any(token in lowered for token in ["dashboard", "kpi", "report", "reports", "analytics"]):
+            module["features"] = _ordered_unique(module["features"] + ["Dashboard and reporting workspace"])
+        if any(token in lowered for token in ["alert", "notification", "email", "sms", "whatsapp"]):
+            module["features"] = _ordered_unique(module["features"] + ["Alerts and notification actions"])
+        if any(token in lowered for token in ["button", "action", "workflow action", "approve button"]):
+            module["features"] = _ordered_unique(module["features"] + ["Interactive workflow action buttons"])
+
+    return modules
+
+
+def _fallback_progress_summary(analysis, conversation_history, captured_topics=None, missing_topics=None):
+    captured = list(captured_topics or _captured_discovery_topics(conversation_history))
+    missing = list(missing_topics or _missing_discovery_topics(analysis, conversation_history))
     summary_bits = [analysis.get("summary", "").strip()]
-    if len(user_messages) > 1:
-        summary_bits.append(f"Captured user inputs across {len(user_messages)} messages.")
-    return " ".join(bit for bit in summary_bits if bit).strip()
+    if captured:
+        summary_bits.append(f"Captured: {', '.join(_discovery_topic_labels(captured[:3]))}.")
+    if missing:
+        summary_bits.append(f"Still clarifying: {', '.join(_discovery_topic_labels(missing[:2]))}.")
+    return " ".join(bit for bit in summary_bits if bit).strip() or "Clarifying the ERP scope."
 
 
 def _fallback_requirements_document(analysis, conversation_history):
-    joined_user_text = "\n".join(msg["content"] for msg in conversation_history if msg.get("role") == "user")
+    joined_user_text = _joined_user_messages(conversation_history)
     modules = [_build_module_definition(name) for name in _infer_modules(joined_user_text or analysis.get("summary", ""), analysis.get("industry", "general business"))]
-    return {
+    requirements = {
         "business_type": analysis.get("business_type", "custom business operation"),
         "industry": analysis.get("industry", "general business"),
         "scale": analysis.get("scale", "small"),
@@ -1398,8 +1793,13 @@ def _fallback_requirements_document(analysis, conversation_history):
             "estimated_users": _estimate_users(analysis.get("scale", "small"), joined_user_text),
             "integrations": _infer_integrations(joined_user_text),
             "special_needs": _infer_special_needs(joined_user_text),
+            "reporting_needs": _infer_reporting_needs(joined_user_text),
+            "access_requirements": _infer_access_requirements(joined_user_text),
+            "captured_topics": _discovery_topic_labels(_captured_discovery_topics(conversation_history)),
         },
     }
+    requirements["modules"] = _augment_requirement_modules(requirements["modules"], joined_user_text)
+    return requirements
 
 
 def _apply_modification(requirements, modification):
@@ -1410,8 +1810,13 @@ def _apply_modification(requirements, modification):
     new_modules = _infer_modules(modification, industry)
     updated["modules"] = _merge_modules(updated.get("modules", []), new_modules)
     general = updated.setdefault("general_requirements", {})
-    general["special_needs"] = _ordered_unique(general.get("special_needs", []) + [modification.strip()])
+    general["special_needs"] = _ordered_unique(general.get("special_needs", []) + _infer_special_needs(modification) + [modification.strip()])
     general["integrations"] = _ordered_unique(general.get("integrations", []) + _infer_integrations(modification))
+    general["reporting_needs"] = _ordered_unique(general.get("reporting_needs", []) + _infer_reporting_needs(modification))
+    general["access_requirements"] = _ordered_unique(general.get("access_requirements", []) + _infer_access_requirements(modification))
+    general["change_requests"] = _ordered_unique(general.get("change_requests", []) + [modification.strip()])
+    if isinstance(updated.get("modules"), list):
+        updated["modules"] = _augment_requirement_modules(updated["modules"], modification)
     return updated
 
 
@@ -1445,6 +1850,70 @@ def _fallback_architecture(requirements, modification=None):
             "auth": "JWT + RBAC",
         },
     }
+
+
+def _merge_architecture_revision(existing_architecture, generated_architecture):
+    if not isinstance(existing_architecture, dict):
+        return generated_architecture
+
+    merged = _deepcopy(existing_architecture)
+    for key in ["system_name", "description", "tech_stack"]:
+        value = generated_architecture.get(key)
+        if value:
+            merged[key] = value
+
+    existing_modules = {
+        str(module.get("name") or module.get("id") or "").strip().lower(): _deepcopy(module)
+        for module in existing_architecture.get("modules", [])
+        if isinstance(module, dict) and str(module.get("name") or module.get("id") or "").strip()
+    }
+    combined_modules = []
+    seen = set()
+    for module in generated_architecture.get("modules", []):
+        if not isinstance(module, dict):
+            continue
+        key = str(module.get("name") or module.get("id") or "").strip().lower()
+        base = existing_modules.get(key, {})
+        merged_module = _deepcopy(base)
+        merged_module.update(module)
+        combined_modules.append(merged_module)
+        if key:
+            seen.add(key)
+    for key, module in existing_modules.items():
+        if key not in seen:
+            combined_modules.append(module)
+    if combined_modules:
+        merged["modules"] = combined_modules
+
+    generated_schema = generated_architecture.get("database_schema")
+    if isinstance(generated_schema, dict) and generated_schema:
+        schema = _deepcopy(existing_architecture.get("database_schema", {}))
+        schema.update(generated_schema)
+        merged["database_schema"] = schema
+
+    existing_roles = {
+        str(role.get("name") or "").strip().lower(): _deepcopy(role)
+        for role in existing_architecture.get("user_roles", [])
+        if isinstance(role, dict) and str(role.get("name") or "").strip()
+    }
+    combined_roles = []
+    seen_roles = set()
+    for role in generated_architecture.get("user_roles", []):
+        if not isinstance(role, dict):
+            continue
+        key = str(role.get("name") or "").strip().lower()
+        merged_role = _deepcopy(existing_roles.get(key, {}))
+        merged_role.update(role)
+        combined_roles.append(merged_role)
+        if key:
+            seen_roles.add(key)
+    for key, role in existing_roles.items():
+        if key not in seen_roles:
+            combined_roles.append(role)
+    if combined_roles:
+        merged["user_roles"] = combined_roles
+
+    return merged
 
 
 def _build_ui_components(module):
@@ -1506,15 +1975,67 @@ def _fallback_master_json(architecture):
     }
 
 
-def _frontend_file_bundle(master_json):
+def _merge_master_json_revision(existing_master_json, generated_master_json):
+    if not isinstance(existing_master_json, dict):
+        return generated_master_json
+
+    merged = _deepcopy(existing_master_json)
+    merged["version"] = str(generated_master_json.get("version") or existing_master_json.get("version") or "1.0.0")
+
+    for key in ["system", "database", "auth", "config"]:
+        combined = _deepcopy(existing_master_json.get(key, {}))
+        if isinstance(generated_master_json.get(key), dict):
+            combined.update(generated_master_json[key])
+        merged[key] = combined
+
+    existing_modules = {
+        str(module.get("id") or module.get("name") or "").strip().lower(): _deepcopy(module)
+        for module in existing_master_json.get("modules", [])
+        if isinstance(module, dict) and str(module.get("id") or module.get("name") or "").strip()
+    }
+    combined_modules = []
+    seen = set()
+    for module in generated_master_json.get("modules", []):
+        if not isinstance(module, dict):
+            continue
+        key = str(module.get("id") or module.get("name") or "").strip().lower()
+        merged_module = _deepcopy(existing_modules.get(key, {}))
+        merged_module.update(module)
+        combined_modules.append(merged_module)
+        if key:
+            seen.add(key)
+    for key, module in existing_modules.items():
+        if key not in seen:
+            combined_modules.append(module)
+    if combined_modules:
+        merged["modules"] = combined_modules
+    else:
+        merged["modules"] = generated_master_json.get("modules", [])
+
+    return merged
+
+
+def _frontend_file_bundle(master_json, template_reference=None):
     modules = master_json.get("modules", [])
     primary = modules[0] if modules else {"name": "Operations", "entities": [{"name": "Record", "fields": []}]}
     primary_entity = primary.get("entities", [{}])[0].get("name", "Record")
     primary_page = f"{_pascal_case(primary['name'])}Page"
     route_path = _kebab_case(primary["name"])
+    template_metadata = dict((master_json.get("documentation") or {}).get("erp_ui_template") or {})
+    if template_reference:
+        template_metadata.setdefault("name", template_reference.get("name"))
+        template_metadata.setdefault("status", template_reference.get("status"))
+        template_metadata.setdefault("summary", template_reference.get("summary"))
+        template_metadata.setdefault("design_cues", template_reference.get("design_cues") or {})
     schema_payload = json.dumps(
         {
             "system": master_json.get("system", {}),
+            "template": {
+                "name": template_metadata.get("name"),
+                "status": template_metadata.get("status"),
+                "summary": template_metadata.get("summary"),
+                "design_cues": template_metadata.get("design_cues") or {},
+            },
             "modules": [
                 {
                     "id": module["id"],
@@ -1563,6 +2084,11 @@ def _frontend_file_bundle(master_json):
               <aside className="fixed inset-y-0 left-0 w-72 border-r bg-white p-6">
                 <h1 className="text-xl font-semibold">{erpSchema.system.name}</h1>
                 <p className="mt-2 text-sm text-slate-500">{erpSchema.system.description}</p>
+                {erpSchema.template?.name ? (
+                  <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                    Template: <span className="font-medium text-slate-800">{erpSchema.template.name}</span>
+                  </div>
+                ) : null}
                 <nav className="mt-8 space-y-2">
                   <Link to="/" className="block rounded-md px-3 py-2 hover:bg-slate-100">Overview</Link>
                   {erpSchema.modules.map((module) => (
@@ -1589,6 +2115,9 @@ def _frontend_file_bundle(master_json):
               <div>
                 <p className="text-sm uppercase tracking-[0.2em] text-slate-500">ERP Overview</p>
                 <h2 className="mt-2 text-3xl font-semibold">{erpSchema.system.name}</h2>
+                {erpSchema.template?.summary ? (
+                  <p className="mt-3 max-w-3xl text-sm text-slate-600">{erpSchema.template.summary}</p>
+                ) : null}
               </div>
               <div className="grid gap-4 md:grid-cols-3">
                 {erpSchema.modules.map((module) => (
@@ -1661,6 +2190,7 @@ def _frontend_file_bundle(master_json):
 
 
 def _backend_file_bundle(master_json):
+    return build_functional_backend_bundle(master_json)
     modules = master_json.get("modules", [])
     primary = modules[0] if modules else {"name": "Operations", "entities": [{"name": "Record", "fields": []}]}
     primary_entity = primary.get("entities", [{}])[0]
@@ -1789,7 +2319,7 @@ def _backend_file_bundle(master_json):
             {"path": "main.py", "language": "python", "content": main_py},
             {"path": "database.py", "language": "python", "content": database_py},
             {"path": "models.py", "language": "python", "content": models_py},
-            {"path": "routes.py", "language": "python", "content": routes_py},
+            {"path": "routes/__init__.py", "language": "python", "content": routes_py},
             {"path": "auth.py", "language": "python", "content": auth_py},
         ],
         "dependencies": {
@@ -1880,33 +2410,77 @@ Output ONLY the JSON object."""
 
 async def requirement_gatherer(analysis, conversation_history):
     modules_list = ", ".join(analysis.get("suggested_modules", []))
-    msg_count = len([m for m in conversation_history if m.get("role") == "user"])
+    user_messages = _user_messages(conversation_history)
+    heuristic_missing = _missing_discovery_topics(analysis, conversation_history)
+    heuristic_captured = _captured_discovery_topics(conversation_history)
+    heuristic_score = _estimate_gathering_score(
+        conversation_history,
+        captured_topics=heuristic_captured,
+        missing_topics=heuristic_missing,
+    )
 
-    force_complete = ""
-    if msg_count >= 3:
-        force_complete = "\n\nIMPORTANT: You have already asked enough questions. You MUST now set complete=true and provide the full requirements document. Do NOT ask more questions."
+    system_prompt = f"""You are the ERP requirements clarification agent for AI ERP Builder.
 
-    system_prompt = f"""You are an ERP Requirements Gathering Agent. You help build an ERP for a {analysis.get('business_type', 'business')} in {analysis.get('industry', 'general')}.
+You are helping define a production-ready ERP for a {analysis.get('business_type', 'business')} in {analysis.get('industry', 'general business')}.
+Your job is to discover what the user truly wants before architecture and code generation start, and then to hand off requirements rich enough for real frontend and backend code generation.
 
-ANALYSIS:
-- Business: {analysis.get('business_type')}
+Known analysis:
+- Business type: {analysis.get('business_type')}
+- Industry: {analysis.get('industry')}
 - Scale: {analysis.get('scale')}
-- Modules: {modules_list}
-- Requirements: {json.dumps(analysis.get('key_requirements', []))}
+- Suggested modules: {modules_list}
+- Key requirements: {json.dumps(analysis.get('key_requirements', []))}
 
-RULES:
-1. Ask about ONE module at a time
-2. Ask 1 clear question per turn
-3. After 2-3 exchanges, compile all info and mark complete
-4. Do NOT repeat already-answered questions{force_complete}
+Heuristic discovery status from the current chat:
+- Captured areas: {json.dumps(_discovery_topic_labels(heuristic_captured))}
+- Likely missing areas: {json.dumps(_discovery_topic_labels(heuristic_missing))}
+- Conservative completeness score: {heuristic_score}
 
-Respond with ONLY valid JSON in one of these formats:
+Rules:
+1. Do not use canned or generic responses. Tailor the wording to the user's actual business, terminology, and latest answer.
+2. Ask the single highest-value next question when critical uncertainty remains, but make that question rich enough to gather multiple specifics.
+3. Do not stop after an arbitrary number of turns. Only set complete=true when the remaining unknowns would no longer materially affect modules, workflows, RBAC, forms, integrations, reports, or generated code behavior.
+4. If the latest user message is vague, ask for the missing operational detail instead of pretending the requirement is clear.
+5. If the information is sufficient, return a complete requirements document detailed enough for architecture, JSON transformation, frontend generation, backend generation, and workflow actions.
+6. Keep completeness_score conservative. Scores above 0.85 mean the ERP can usually move forward without another clarification turn.
 
-If asking a question:
-{{"complete": false, "question": "Your question?", "current_module": "Module Name", "progress_summary": "What you know so far"}}
+Respond with ONLY valid JSON in this shape:
+{{
+  "complete": false,
+  "assistant_response": "Short contextual reply that reflects what the user just told you and asks the next tailored question.",
+  "question": "The exact next question",
+  "current_module": "Module Name or Cross-functional",
+  "progress_summary": "Concise summary of what is already known and what remains unclear",
+  "completeness_score": 0.0,
+  "missing_topics": ["topic label"],
+  "captured_topics": ["topic label"],
+  "question_rationale": "What this question will unlock for architecture/code generation",
+  "requirements": null
+}}
 
-If requirements are complete:
-{{"complete": true, "requirements": {{"business_type": "{analysis.get('business_type')}", "industry": "{analysis.get('industry')}", "scale": "{analysis.get('scale')}", "modules": [{{"name": "Module", "description": "desc", "features": ["f1"], "entities": ["e1"], "workflows": ["w1"], "user_roles": ["r1"]}}], "general_requirements": {{"estimated_users": "number", "integrations": ["i1"], "special_needs": ["s1"]}}}}}}
+If complete=true, keep assistant_response short and return the full requirements object:
+{{
+  "business_type": "{analysis.get('business_type')}",
+  "industry": "{analysis.get('industry')}",
+  "scale": "{analysis.get('scale')}",
+  "modules": [
+    {{
+      "name": "Module",
+      "description": "What it does",
+      "features": ["feature"],
+      "entities": ["Entity"],
+      "workflows": ["Workflow"],
+      "user_roles": ["Role"]
+    }}
+  ],
+  "general_requirements": {{
+    "estimated_users": "number or range",
+    "integrations": ["integration"],
+    "special_needs": ["need"],
+    "reporting_needs": ["reporting need"],
+    "access_requirements": ["rbac detail"]
+  }}
+}}
 
 Output ONLY JSON."""
 
@@ -1915,58 +2489,90 @@ Output ONLY JSON."""
         if msg.get("role") in ["user", "assistant"]:
             messages.append({"role": msg["role"], "content": msg["content"]})
 
+    def normalize_gatherer_payload(payload):
+        if isinstance(payload, list):
+            payload = payload[0] if payload and isinstance(payload[0], dict) else {"complete": False, "question": ""}
+        if not isinstance(payload, dict):
+            payload = {"complete": False}
+
+        missing_topic_ids = heuristic_missing
+        captured_topic_ids = heuristic_captured
+        fallback_topic_id = _topic_for_follow_up(analysis, conversation_history, missing_topic_ids)
+        fallback_module = _current_module_for_topic(analysis, conversation_history, fallback_topic_id)
+        fallback_question = _build_follow_up_question(
+            analysis,
+            conversation_history,
+            topic_id=fallback_topic_id,
+            current_module=fallback_module,
+        )
+        fallback_rationale = _question_rationale_for_topic(fallback_topic_id)
+        fallback_summary = _fallback_progress_summary(
+            analysis,
+            conversation_history,
+            captured_topics=captured_topic_ids,
+            missing_topics=missing_topic_ids,
+        )
+        fallback_requirements = _fallback_requirements_document(analysis, conversation_history)
+
+        complete = bool(payload.get("complete"))
+        requirements = payload.get("requirements") if isinstance(payload.get("requirements"), dict) else None
+        current_module = str(payload.get("current_module") or "").strip() or fallback_module
+        question = str(payload.get("question") or "").strip() or fallback_question
+        question_rationale = str(payload.get("question_rationale") or "").strip() or fallback_rationale
+        progress_summary = _stringify_progress_summary(payload.get("progress_summary")) or fallback_summary
+        completeness_score = _coerce_score(payload.get("completeness_score"), heuristic_score)
+        assistant_response = str(payload.get("assistant_response") or "").strip()
+        missing_topics = _normalize_string_list(payload.get("missing_topics")) or _discovery_topic_labels(missing_topic_ids)
+        captured_topics = _normalize_string_list(payload.get("captured_topics")) or _discovery_topic_labels(captured_topic_ids)
+
+        if complete and requirements is None:
+            if completeness_score >= 0.86 or len(user_messages) >= 4 or not missing_topic_ids:
+                requirements = fallback_requirements
+                completeness_score = max(completeness_score, 0.9)
+            else:
+                complete = False
+
+        if not complete:
+            completeness_score = min(completeness_score, 0.84 if missing_topics else 0.89)
+            if not assistant_response:
+                assistant_response = "\n\n".join(
+                    part for part in [progress_summary, question] if str(part or "").strip()
+                ).strip()
+        else:
+            requirements = requirements or fallback_requirements
+            completeness_score = max(completeness_score, 0.9)
+            if not assistant_response:
+                assistant_response = (
+                    f"I have enough detail to generate the ERP now for {analysis.get('business_type', 'this business')}."
+                )
+
+        return {
+            "complete": complete,
+            "assistant_response": assistant_response or question,
+            "question": None if complete else question,
+            "current_module": current_module,
+            "progress_summary": progress_summary,
+            "completeness_score": completeness_score,
+            "missing_topics": missing_topics,
+            "captured_topics": captured_topics,
+            "question_rationale": question_rationale,
+            "requirements": requirements,
+        }
+
     try:
         result = await call_llm(
             messages,
-            temperature=0.4,
+            temperature=0.35,
             max_tokens=REQUIREMENT_GATHERING_MAX_TOKENS,
             timeout=ANALYSIS_TIMEOUT,
             model_group="analysis",
         )
         logger.info("Gatherer raw response: %s", result[:500])
         parsed = _extract_json(result)
-        if isinstance(parsed, list):
-            parsed = parsed[0] if parsed and isinstance(parsed[0], dict) else {"complete": False, "question": result.strip()}
-        if isinstance(parsed, dict):
-            parsed["progress_summary"] = _stringify_progress_summary(parsed.get("progress_summary"))
-            if msg_count >= 3:
-                requirements = parsed.get("requirements")
-                if not parsed.get("complete") or not isinstance(requirements, dict):
-                    return {
-                        "complete": True,
-                        "requirements": _fallback_requirements_document(analysis, conversation_history),
-                        "progress_summary": parsed.get("progress_summary")
-                        or _fallback_progress_summary(analysis, conversation_history),
-                    }
-        elif msg_count >= 3:
-            return {
-                "complete": True,
-                "requirements": _fallback_requirements_document(analysis, conversation_history),
-                "progress_summary": _fallback_progress_summary(analysis, conversation_history),
-            }
-        return parsed
+        return normalize_gatherer_payload(parsed)
     except Exception as exc:
         logger.warning("Requirement gatherer falling back to local generation: %s", exc)
-        module_names = analysis.get("suggested_modules", ["Operations"])
-        question_module = module_names[min(max(msg_count - 1, 0), max(len(module_names) - 1, 0))]
-        if msg_count <= 1:
-            return {
-                "complete": False,
-                "question": f"For {question_module}, what are the most important workflows, approval steps, or reports you need first?",
-                "current_module": question_module,
-                "progress_summary": _fallback_progress_summary(analysis, conversation_history),
-            }
-        if msg_count == 2:
-            return {
-                "complete": False,
-                "question": "How many users or locations will use the system, and which integrations or notifications should it support?",
-                "current_module": question_module,
-                "progress_summary": _fallback_progress_summary(analysis, conversation_history),
-            }
-        return {
-            "complete": True,
-            "requirements": _fallback_requirements_document(analysis, conversation_history),
-        }
+        return normalize_gatherer_payload({"complete": False})
 
 
 async def erp_architect(requirements, modification=None, existing_architecture=None, existing_master_json=None):
@@ -2087,7 +2693,8 @@ Design 4-8 realistic modules with production-grade entities, endpoints, workflow
         return parsed
     except Exception as exc:
         logger.warning("ERP architect falling back to local generation: %s", exc)
-        return _fallback_architecture(requirements, modification)
+        fallback = _fallback_architecture(requirements, modification)
+        return _merge_architecture_revision(existing_architecture, fallback)
 
 
 async def json_transformer(architecture, existing_master_json=None, change_request=None):
@@ -2198,7 +2805,8 @@ Output ONLY JSON."""
         return merged
     except Exception as exc:
         logger.warning("JSON transformer falling back to local generation: %s", exc)
-        return _fallback_master_json(architecture)
+        fallback = _fallback_master_json(architecture)
+        return _merge_master_json_revision(existing_master_json, fallback)
 
 
 def _fallback_markdown_blueprint(project_name, conversation_transcript, requirements, architecture, master_json):
@@ -2212,6 +2820,7 @@ def _fallback_markdown_blueprint(project_name, conversation_transcript, requirem
     tables = master_json.get("database", {}).get("tables", [])
     roles = master_json.get("auth", {}).get("roles", [])
     permissions = master_json.get("auth", {}).get("permissions", {})
+    template_metadata = dict((master_json.get("documentation") or {}).get("erp_ui_template") or {})
 
     lines = [
         f"# {system_name} Build Guide",
@@ -2232,8 +2841,33 @@ def _fallback_markdown_blueprint(project_name, conversation_transcript, requirem
         "## Conversation Summary",
         conversation_transcript or "No project conversation transcript was captured.",
         "",
+        "## UI and UX Template Reference",
+        (
+            "The generated ERP frontend should follow the external template reference instead of inventing a new design language. "
+            "This applies only to ERP apps generated from prompts, not to the AI ERP Builder interface itself."
+        ),
+        f"- Template Name: {template_metadata.get('name', 'Template 1')}",
+        f"- Template Status: {template_metadata.get('status', 'unknown')}",
+        f"- Template Directory: {template_metadata.get('relative_directory', 'Template/Template 1')}",
+        f"- Template JSON: {template_metadata.get('json_relative_path', 'Template/Template 1/Json1.json')}",
+        f"- Template Markdown: {template_metadata.get('markdown_relative_path', 'Template/Template 1/Md1.md')}",
+        f"- Template Summary: {template_metadata.get('summary') or 'No markdown summary was detected.'}",
+        "",
         "## Module Breakdown",
     ]
+
+    if template_metadata.get("design_cues"):
+        lines.append("### Captured Design Cues")
+        for key, value in template_metadata["design_cues"].items():
+            rendered = value if isinstance(value, str) else json.dumps(value)
+            lines.append(f"- {key}: {rendered[:240]}")
+        lines.append("")
+
+    if template_metadata.get("warnings"):
+        lines.append("### Template Warnings")
+        for warning in template_metadata["warnings"]:
+            lines.append(f"- {warning}")
+        lines.append("")
 
     if not modules:
         lines.append("- No modules were provided in the master blueprint. Use the architecture and requirements to define the first implementation slice.")
@@ -2393,6 +3027,7 @@ async def markdown_blueprint_generator(
     master_json,
     existing_markdown=None,
     change_request=None,
+    template_reference=None,
 ):
     revision_text = ""
     if existing_markdown or change_request:
@@ -2406,6 +3041,12 @@ async def markdown_blueprint_generator(
             {str(existing_markdown or '')[:14000]}
             """
         ).strip()
+
+    template_context = format_erp_ui_template_prompt_context(
+        template_reference,
+        json_char_limit=4500,
+        markdown_char_limit=4500,
+    )
 
     system_prompt = dedent(
         f"""
@@ -2422,6 +3063,9 @@ async def markdown_blueprint_generator(
         - The result must be detailed enough that the code-generation stage can build deployable ERP modules directly from the Markdown and JSON together.
         - When revising, keep the same ERP continuity and update only what the new chat request changes.
         - Be explicit about modules, flows, data rules, reports, dashboards, forms, deployment assumptions, and future editability.
+        - When an ERP UI/UX template reference is supplied, treat it as the authoritative frontend style and interaction guide for the generated ERP.
+        - Capture the template's layout, navigation, dashboard composition, forms, tables, detail views, spacing, and interaction cues in the frontend implementation guidance.
+        - Never apply the template to the AI ERP Builder product UI itself; it only governs ERP applications generated from prompts.
         {revision_text}
         """
     ).strip()
@@ -2441,7 +3085,8 @@ async def markdown_blueprint_generator(
                 f"Conversation Transcript:\n{transcript}\n\n"
                 f"Requirements JSON:\n{json.dumps(requirements, indent=2)}\n\n"
                 f"Architecture JSON:\n{json.dumps(architecture, indent=2)}\n\n"
-                f"Master ERP JSON:\n{blueprint}"
+                f"Master ERP JSON:\n{blueprint}\n\n"
+                f"{template_context}"
             ),
         },
     ]
@@ -2463,7 +3108,16 @@ async def markdown_blueprint_generator(
         return _fallback_markdown_blueprint(project_name, conversation_transcript, requirements, architecture, master_json)
 
 
-async def frontend_generator(master_json, implementation_markdown=None, existing_bundle=None, change_request=None):
+async def frontend_generator(
+    master_json,
+    implementation_markdown=None,
+    existing_bundle=None,
+    change_request=None,
+    template_reference=None,
+):
+    if template_reference and template_reference.get("has_actionable_content"):
+        return build_template_driven_frontend_bundle(master_json, template_reference=template_reference)
+
     revision_text = ""
     if existing_bundle or change_request:
         revision_text = (
@@ -2474,6 +3128,12 @@ async def frontend_generator(master_json, implementation_markdown=None, existing
             f"\nChange request: {change_request or 'No explicit change request provided.'}"
             f"\nExisting frontend bundle:\n{json.dumps(existing_bundle or {}, indent=2)[:14000]}"
         )
+
+    template_context = format_erp_ui_template_prompt_context(
+        template_reference,
+        json_char_limit=5000,
+        markdown_char_limit=5000,
+    )
 
     system_prompt = revision_text + """You are a Frontend Code Generator. Generate a deployable React + Tailwind ERP frontend from the ERP JSON schema and Markdown implementation guide.
 
@@ -2494,6 +3154,9 @@ Rules:
 - Return complete contents for every file you touch.
 - Keep the output deployable, consistent, and easy to edit again on future chat requests.
 - Prefer stable file paths across revisions so follow-up edits can continue on top of the existing bundle.
+- When an ERP UI/UX template reference is provided, match that template's visual language and UX patterns for the generated ERP as closely as the blueprint allows.
+- Reuse the template's layout structure, navigation patterns, content hierarchy, dashboard rhythm, table/form styling, and interaction cues instead of inventing a different frontend shell.
+- Do not restyle the AI ERP Builder application itself. Only generate ERP frontend code that follows the external template.
 
 Use Tailwind CSS and lucide-react where appropriate. Output ONLY JSON."""
 
@@ -2503,7 +3166,8 @@ Use Tailwind CSS and lucide-react where appropriate. Output ONLY JSON."""
             "role": "user",
             "content": (
                 f"Schema:\n{json.dumps(master_json, indent=2)}\n\n"
-                f"Implementation Markdown:\n{(implementation_markdown or '').strip()[:8000]}"
+                f"Implementation Markdown:\n{(implementation_markdown or '').strip()[:8000]}\n\n"
+                f"{template_context}"
             ),
         },
     ]
@@ -2515,10 +3179,13 @@ Use Tailwind CSS and lucide-react where appropriate. Output ONLY JSON."""
             timeout=CODE_GENERATION_TIMEOUT,
             model_group="code",
         )
-        return _extract_json(result)
+        parsed = _extract_json(result)
+        if _is_actionable_frontend_bundle(parsed):
+            return parsed
+        raise ValueError("Frontend generator returned a non-actionable bundle")
     except Exception as exc:
         logger.warning("Frontend generator falling back to local generation: %s", exc)
-        return _frontend_file_bundle(master_json)
+        return build_template_driven_frontend_bundle(master_json, template_reference=template_reference)
 
 
 async def backend_generator(master_json, implementation_markdown=None, existing_bundle=None, change_request=None):
@@ -2540,7 +3207,7 @@ Respond with ONLY valid JSON:
   "files": [
     {"path": "main.py", "language": "python", "content": "# code"},
     {"path": "models.py", "language": "python", "content": "# models"},
-    {"path": "routes.py", "language": "python", "content": "# routes"},
+    {"path": "routes/__init__.py", "language": "python", "content": "# routes"},
     {"path": "auth.py", "language": "python", "content": "# auth"},
     {"path": "database.py", "language": "python", "content": "# db setup"}
   ],
@@ -2576,7 +3243,10 @@ Include proper validation, error handling, and runtime-readiness. Output ONLY JS
             timeout=CODE_GENERATION_TIMEOUT,
             model_group="code",
         )
-        return _extract_json(result)
+        parsed = _extract_json(result)
+        if _is_actionable_backend_bundle(parsed):
+            return parsed
+        raise ValueError("Backend generator returned a non-actionable bundle")
     except Exception as exc:
         logger.warning("Backend generator falling back to local generation: %s", exc)
         return _backend_file_bundle(master_json)

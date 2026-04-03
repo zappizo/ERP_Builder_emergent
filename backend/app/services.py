@@ -13,6 +13,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from agents import (
+    analysis_model_label,
     backend_generator,
     code_reviewer,
     erp_architect,
@@ -72,6 +73,7 @@ from .schemas import (
     RequirementSessionRead,
     RequirementsDocumentPayload,
 )
+from .template_loader import attach_erp_ui_template_metadata, load_erp_ui_template
 
 
 logger = logging.getLogger(__name__)
@@ -228,6 +230,7 @@ async def generate_code_bundles(
     existing_frontend_bundle: dict[str, Any] | None = None,
     existing_backend_bundle: dict[str, Any] | None = None,
     change_request: str | None = None,
+    template_reference: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     frontend_result, backend_result = await asyncio.gather(
         _generate_candidate_code_bundle(
@@ -237,6 +240,7 @@ async def generate_code_bundles(
             markdown_spec,
             existing_bundle=existing_frontend_bundle,
             change_request=change_request,
+            template_reference=template_reference,
         ),
         _generate_candidate_code_bundle(
             backend_generator,
@@ -245,6 +249,7 @@ async def generate_code_bundles(
             markdown_spec,
             existing_bundle=existing_backend_bundle,
             change_request=change_request,
+            template_reference=template_reference,
         ),
         return_exceptions=True,
     )
@@ -394,6 +399,41 @@ def _validate_review(payload: Any) -> dict[str, Any]:
     return CodeReviewPayload.model_validate(payload).model_dump()
 
 
+def _coerce_completeness_score(value: Any, default: float) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        score = float(default)
+    return min(max(score, 0.0), 1.0)
+
+
+def _gathering_stage_output(gathered: GatheringPayload, *, analysis: dict[str, Any] | None = None) -> dict[str, Any]:
+    output = {
+        "complete": gathered.complete,
+        "assistant_response": gathered.assistant_response,
+        "question": gathered.question,
+        "current_module": gathered.current_module,
+        "progress_summary": gathered.progress_summary,
+        "completeness_score": gathered.completeness_score,
+        "missing_topics": list(gathered.missing_topics or []),
+        "captured_topics": list(gathered.captured_topics or []),
+        "question_rationale": gathered.question_rationale,
+        "analysis_model": analysis_model_label(),
+    }
+    if analysis:
+        output["analysis_summary"] = analysis.get("summary")
+        output["business_type"] = analysis.get("business_type")
+        output["industry"] = analysis.get("industry")
+        output["suggested_modules"] = list(analysis.get("suggested_modules") or [])
+    if gathered.complete and gathered.requirements:
+        output["requirements"] = gathered.requirements.model_dump()
+    return output
+
+
+def _gathering_response_message(gathered: GatheringPayload, fallback: str) -> str:
+    return (gathered.assistant_response or gathered.question or fallback).strip()
+
+
 def _artifact_bundle_from_rows(artifacts: list[GeneratedArtifact]) -> dict[str, Any]:
     dependencies: dict[str, Any] = {}
     files = []
@@ -426,6 +466,7 @@ def hydrate_pipeline_outputs_from_current_version(db: Session, project: Project)
     snapshot = dict(project_version.snapshot_json or {})
     master_json_output = dict(snapshot.get("master_json") or {})
     if master_json_output:
+        master_json_output = attach_erp_ui_template_metadata(master_json_output)
         documentation = dict(master_json_output.get("documentation") or {})
         if snapshot.get("build_markdown") and not documentation.get("erp_build_markdown"):
             documentation["erp_build_markdown"] = snapshot.get("build_markdown")
@@ -493,7 +534,7 @@ def _load_revision_context(db: Session, project: Project) -> dict[str, Any]:
         "version_label": project_version.version_label,
         "changelog": project_version.changelog,
         "architecture": snapshot.get("architecture") or {},
-        "master_json": snapshot.get("master_json") or {},
+        "master_json": attach_erp_ui_template_metadata(snapshot.get("master_json") or {}),
         "build_markdown": snapshot.get("build_markdown") or "",
         "review": snapshot.get("review") or {},
     }
@@ -601,6 +642,7 @@ async def _invoke_code_generator(
     *,
     existing_bundle: dict[str, Any] | None = None,
     change_request: str | None = None,
+    template_reference: dict[str, Any] | None = None,
 ) -> Any:
     generator_signature = signature(generator)
     kwargs: dict[str, Any] = {}
@@ -608,6 +650,8 @@ async def _invoke_code_generator(
         kwargs["existing_bundle"] = existing_bundle
     if "change_request" in generator_signature.parameters:
         kwargs["change_request"] = change_request
+    if "template_reference" in generator_signature.parameters:
+        kwargs["template_reference"] = template_reference
     return await generator(master_json, markdown_spec, **kwargs)
 
 
@@ -619,6 +663,7 @@ async def _generate_candidate_code_bundle(
     *,
     existing_bundle: dict[str, Any] | None = None,
     change_request: str | None = None,
+    template_reference: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     candidate_bundle = _validate_bundle(
         await _invoke_code_generator(
@@ -627,6 +672,7 @@ async def _generate_candidate_code_bundle(
             markdown_spec,
             existing_bundle=existing_bundle,
             change_request=change_request,
+            template_reference=template_reference,
         )
     )
     changed = _bundle_candidate_changes_existing(existing_bundle, candidate_bundle)
@@ -639,6 +685,7 @@ async def _generate_candidate_code_bundle(
                 markdown_spec,
                 existing_bundle=existing_bundle,
                 change_request=_strengthen_revision_request(change_request, target),
+                template_reference=template_reference,
             )
         )
         changed = _bundle_candidate_changes_existing(existing_bundle, candidate_bundle)
@@ -656,6 +703,7 @@ async def _invoke_markdown_blueprint_generator(
     *,
     existing_markdown: str | None = None,
     change_request: str | None = None,
+    template_reference: dict[str, Any] | None = None,
 ) -> str:
     generator_signature = signature(generator)
     kwargs: dict[str, Any] = {}
@@ -663,6 +711,8 @@ async def _invoke_markdown_blueprint_generator(
         kwargs["existing_markdown"] = existing_markdown
     if "change_request" in generator_signature.parameters:
         kwargs["change_request"] = change_request
+    if "template_reference" in generator_signature.parameters:
+        kwargs["template_reference"] = template_reference
     return await generator(
         project_name,
         conversation_transcript,
@@ -796,6 +846,8 @@ async def _queue_generation(
         status=project.status,
         auto_advance=True,
         requirements=requirement_session.normalized_requirements,
+        completeness_score=project.requirement_completeness,
+        analysis_model=analysis_model_label(),
     )
 
 
@@ -831,44 +883,43 @@ async def handle_project_chat(
             requirement_session.normalized_requirements = normalized
             requirement_session.status = "completed"
             requirement_session.completeness_score = 1.0
+            requirement_session.current_module = gathered.current_module
+            requirement_session.summary = gathered.progress_summary or analysis.get("summary", "")
             project.requirement_completeness = 1.0
-            update_stage(project, "requirement_gathering", "complete", normalized)
+            update_stage(project, "requirement_gathering", "complete", _gathering_stage_output(gathered, analysis=analysis))
             db.commit()
             return await _queue_generation(db, project, user, background_tasks)
 
-        question = gathered.question or "What module or workflow should the ERP prioritize first?"
-        summary_message = (
-            f"I've analyzed your request and identified the following:\n\n"
-            f"**Business Type:** {analysis.get('business_type', 'N/A')}\n"
-            f"**Industry:** {analysis.get('industry', 'N/A')}\n"
-            f"**Scale:** {analysis.get('scale', 'N/A')}\n"
-            f"**Suggested Modules:** {', '.join(analysis.get('suggested_modules', []))}\n\n"
-            f"Let me ask a few questions to refine the requirements.\n\n"
-            f"{question}"
-        )
+        assistant_message = _gathering_response_message(gathered, "What module or workflow should the ERP prioritize first?")
         db.add(
             ClarificationQuestion(
                 requirement_session_id=requirement_session.id,
                 project_id=project.id,
-                question_text=question,
+                question_text=gathered.question or assistant_message,
                 module_name=gathered.current_module,
                 status="pending",
             )
         )
         requirement_session.status = "collecting"
         requirement_session.current_module = gathered.current_module
-        requirement_session.summary = gathered.progress_summary or summary_message
-        requirement_session.completeness_score = 0.5
-        project.requirement_completeness = 0.5
+        requirement_session.summary = gathered.progress_summary or analysis.get("summary", "")
+        requirement_session.completeness_score = max(0.3, _coerce_completeness_score(gathered.completeness_score, 0.5))
+        project.requirement_completeness = requirement_session.completeness_score
         project.status = "GATHERING"
-        add_project_message(db, project.id, "assistant", summary_message, agent="requirement_gatherer")
+        update_stage(project, "requirement_gathering", "running", _gathering_stage_output(gathered, analysis=analysis))
+        add_project_message(db, project.id, "assistant", assistant_message, agent="requirement_gatherer")
         db.commit()
         return ChatResponse(
-            response=summary_message,
+            response=assistant_message,
             status=project.status,
             analysis=analysis,
             current_module=gathered.current_module,
             progress=gathered.progress_summary,
+            completeness_score=project.requirement_completeness,
+            missing_topics=list(gathered.missing_topics or []),
+            captured_topics=list(gathered.captured_topics or []),
+            question_rationale=gathered.question_rationale,
+            analysis_model=analysis_model_label(),
         )
 
     if project.status == "GATHERING":
@@ -903,32 +954,46 @@ async def handle_project_chat(
             requirement_session.normalized_requirements = normalized
             requirement_session.status = "completed"
             requirement_session.completeness_score = 1.0
+            requirement_session.current_module = gathered.current_module
+            requirement_session.summary = gathered.progress_summary or requirement_session.summary
             project.requirement_completeness = 1.0
-            update_stage(project, "requirement_gathering", "complete", normalized)
+            update_stage(project, "requirement_gathering", "complete", _gathering_stage_output(gathered, analysis=requirement_session.analysis_json))
             db.commit()
             return await _queue_generation(db, project, user, background_tasks)
 
-        question = gathered.question or "What else should the system support operationally?"
+        assistant_message = _gathering_response_message(gathered, "What else should the system support operationally?")
         db.add(
             ClarificationQuestion(
                 requirement_session_id=requirement_session.id,
                 project_id=project.id,
-                question_text=question,
+                question_text=gathered.question or assistant_message,
                 module_name=gathered.current_module,
                 status="pending",
             )
         )
         requirement_session.current_module = gathered.current_module
-        requirement_session.summary = gathered.progress_summary or question
-        requirement_session.completeness_score = min(requirement_session.completeness_score + 0.15, 0.9)
+        requirement_session.summary = gathered.progress_summary or requirement_session.summary
+        requirement_session.completeness_score = min(
+            max(
+                requirement_session.completeness_score,
+                _coerce_completeness_score(gathered.completeness_score, requirement_session.completeness_score or 0.5),
+            ),
+            0.95,
+        )
         project.requirement_completeness = requirement_session.completeness_score
-        add_project_message(db, project.id, "assistant", question, agent="requirement_gatherer")
+        update_stage(project, "requirement_gathering", "running", _gathering_stage_output(gathered, analysis=requirement_session.analysis_json))
+        add_project_message(db, project.id, "assistant", assistant_message, agent="requirement_gatherer")
         db.commit()
         return ChatResponse(
-            response=question,
+            response=assistant_message,
             status=project.status,
             current_module=gathered.current_module,
             progress=gathered.progress_summary,
+            completeness_score=project.requirement_completeness,
+            missing_topics=list(gathered.missing_topics or []),
+            captured_topics=list(gathered.captured_topics or []),
+            question_rationale=gathered.question_rationale,
+            analysis_model=analysis_model_label(),
         )
 
     if project.status in {"ARCHITECTING", "TRANSFORMING", "GENERATING_FRONTEND", "GENERATING_BACKEND", "REVIEWING"}:
@@ -936,6 +1001,7 @@ async def handle_project_chat(
         return ChatResponse(
             response="The project is still processing. Please wait for the current job to finish.",
             status=project.status,
+            analysis_model=analysis_model_label(),
         )
 
     db.commit()
@@ -953,6 +1019,7 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
         requirement_session = get_requirement_session(db, project)
         requirements = _validate_requirements(requirement_session.normalized_requirements)
         revision_context = _load_revision_context(db, project) if change_request else {}
+        template_reference = load_erp_ui_template()
 
         job.status = "running"
         job.started_at = utc_now()
@@ -998,6 +1065,7 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
                 change_request=change_request,
             )
         )
+        master_json = attach_erp_ui_template_metadata(master_json, template_reference)
         conversation_transcript = build_chat_transcript(db, project.id)
         markdown_spec = await _invoke_markdown_blueprint_generator(
             markdown_blueprint_generator,
@@ -1008,6 +1076,7 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
             master_json,
             existing_markdown=revision_context.get("build_markdown"),
             change_request=change_request,
+            template_reference=template_reference,
         )
         documentation = dict(master_json.get("documentation") or {})
         documentation["erp_build_markdown"] = markdown_spec
@@ -1053,6 +1122,7 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
             existing_frontend_bundle=revision_context.get("frontend_bundle"),
             existing_backend_bundle=revision_context.get("backend_bundle"),
             change_request=change_request,
+            template_reference=template_reference,
         )
         update_stage(project, "frontend_generation", "complete", frontend_bundle)
         update_stage(project, "backend_generation", "complete", backend_bundle)
@@ -1270,24 +1340,46 @@ async def ensure_markdown_documentation(db: Session, project: Project) -> dict[s
     if json_stage.get("status") != "complete":
         return json_stage.get("output")
 
-    output = dict(json_stage.get("output") or {})
+    original_output = dict(json_stage.get("output") or {})
+    output = dict(original_output)
     if not output:
         return output
 
+    template_reference = load_erp_ui_template()
+    output = attach_erp_ui_template_metadata(output, template_reference)
+    metadata_changed = output != original_output
     documentation = dict(output.get("documentation") or {})
     existing_markdown = documentation.get("erp_build_markdown")
     if existing_markdown and is_valid_markdown_blueprint(existing_markdown):
+        if metadata_changed:
+            json_stage["output"] = output
+            json_stage["updated_at"] = now_iso()
+            state["json_transform"] = json_stage
+            project.pipeline_state = state
+            project.updated_at = utc_now()
+
+            if project.current_project_version_id:
+                project_version = db.query(ProjectVersion).filter(ProjectVersion.id == project.current_project_version_id).first()
+                if project_version:
+                    snapshot = dict(project_version.snapshot_json or {})
+                    snapshot["master_json"] = output
+                    project_version.snapshot_json = snapshot
+
+            db.commit()
+            db.refresh(project)
         return output
 
     requirement_session = get_requirement_session(db, project)
     architecture_output = dict((state.get("architecture") or {}).get("output") or {})
     conversation_transcript = build_chat_transcript(db, project.id)
-    markdown_spec = await markdown_blueprint_generator(
+    markdown_spec = await _invoke_markdown_blueprint_generator(
+        markdown_blueprint_generator,
         project.name,
         conversation_transcript,
         requirement_session.normalized_requirements or {},
         architecture_output,
         output,
+        template_reference=template_reference,
     )
 
     documentation["erp_build_markdown"] = markdown_spec

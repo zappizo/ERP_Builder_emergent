@@ -16,8 +16,10 @@ if str(ROOT) not in sys.path:
 from backend.app.local_runner import (
     _build_backend_runtime_files,
     _build_frontend_runtime_files,
+    _normalize_python_package_files,
     _patch_backend_main_file,
     _patch_sqlalchemy_extend_existing,
+    _remove_shadowing_package_modules,
     _reset_runtime_directory,
     _repair_sqlalchemy_models_file,
     _url_ready,
@@ -93,6 +95,58 @@ app.include_router(project_management_router, prefix="/api")
     assert "project_management_router = None" in patched
     assert "router as project_management_router = None" not in patched
     assert "if project_management_router is not None:\n    app.include_router(project_management_router, prefix=\"/api\")" in patched
+
+
+def test_patch_backend_main_file_handles_routes_submodule_imports_safely():
+    content = """from fastapi import FastAPI
+from routes.patient_management import router as patient_router
+
+app = FastAPI()
+app.include_router(patient_router, prefix="/api/patient-management")
+"""
+
+    patched = _patch_backend_main_file(content)
+
+    assert "try:\n    from routes.patient_management import router as patient_router\nexcept Exception:\n    patient_router = None" in patched
+    assert "if patient_router is not None:\n    app.include_router(patient_router, prefix=\"/api/patient-management\")" in patched
+
+
+def test_normalize_python_package_files_promotes_shadowing_module_into_package():
+    files = _normalize_python_package_files(
+        [
+            {"path": "routes.py", "language": "python", "content": "from fastapi import APIRouter\nrouter = APIRouter()\n"},
+            {"path": "routes/patient_management.py", "language": "python", "content": "from fastapi import APIRouter\nrouter = APIRouter()\n"},
+        ]
+    )
+
+    file_map = {entry["path"]: entry["content"] for entry in files}
+
+    assert "routes.py" not in file_map
+    assert "routes/__init__.py" in file_map
+    assert "router = APIRouter()" in file_map["routes/__init__.py"]
+    assert "routes/patient_management.py" in file_map
+
+
+def test_remove_shadowing_package_modules_deletes_conflicting_module_file():
+    runtime_dir = ROOT / f"_tmp_local_runner_{uuid.uuid4().hex}"
+    try:
+        runtime_dir.mkdir()
+        (runtime_dir / "routes").mkdir()
+        (runtime_dir / "routes.py").write_text("shadow", encoding="utf-8")
+        (runtime_dir / "routes" / "__init__.py").write_text("", encoding="utf-8")
+
+        _remove_shadowing_package_modules(
+            runtime_dir,
+            [
+                {"path": "routes/__init__.py", "language": "python", "content": ""},
+                {"path": "routes/patient_management.py", "language": "python", "content": ""},
+            ],
+        )
+
+        assert not (runtime_dir / "routes.py").exists()
+        assert (runtime_dir / "routes" / "__init__.py").exists()
+    finally:
+        shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
 def test_repair_sqlalchemy_models_file_fixes_common_indentation_damage():
