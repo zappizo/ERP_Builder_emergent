@@ -1,0 +1,23 @@
+{
+  "name": "erp_builder_emergent",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zappizo/ERP_Builder_emergent.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/zappizo/ERP_Builder_emergent/issues"
+  },
+  "homepage": "https://github.com/zappizo/ERP_Builder_emergent#readme"
+}

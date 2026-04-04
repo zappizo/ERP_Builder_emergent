@@ -1,0 +1,11 @@
+﻿906: async def call_llm(messages, temperature=0.7, max_tokens=4000, timeout=None):
+1793: async def requirement_analyzer(prompt):
+1854: async def requirement_gatherer(analysis, conversation_history, *, coverage_context: str = "", force_complete: bool = False):
+2037: async def erp_architect(requirements, modification=None):
+2131: async def json_transformer(architecture):
+2355: async def markdown_blueprint_generator(project_name, conversation_transcript, requirements, architecture, master_json):
+2407: async def frontend_generator(master_json, implementation_markdown=None):
+2447: async def backend_generator(master_json, implementation_markdown=None):
+2489: async def code_reviewer(frontend_code, backend_code):
+
+Total: 9 async functions

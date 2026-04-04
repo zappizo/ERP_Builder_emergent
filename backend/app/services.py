@@ -19,6 +19,7 @@ from agents import (
     requirement_analyzer,
     requirement_gatherer,
 )
+from question_engine import QuestionEngine
 
 from .db import SessionLocal
 from .models import (
@@ -411,16 +412,20 @@ async def handle_project_chat(
         update_stage(project, "requirement_analysis", "complete", analysis)
         update_stage(project, "requirement_gathering", "running")
 
+        # NEVER auto-complete on first call — always start with questions
         gathered = _validate_gathering(await requirement_gatherer(analysis, conversation_history))
-        if gathered.complete and gathered.requirements:
-            normalized = _validate_requirements(gathered.requirements.model_dump())
-            requirement_session.normalized_requirements = normalized
-            requirement_session.status = "completed"
-            requirement_session.completeness_score = 1.0
-            project.requirement_completeness = 1.0
-            update_stage(project, "requirement_gathering", "complete", normalized)
-            db.commit()
-            return await _queue_generation(db, project, user, background_tasks)
+        if gathered.complete:
+            # Override: force question mode on first exchange
+            gathered.complete = False
+            if not gathered.question:
+                gathered.question = (
+                    "Let me understand your business operations in depth. Please help me with these:\n\n"
+                    f"1. Walk me through your core business process from start to finish — how does a typical transaction flow in your {analysis.get('business_type', 'business')}?\n"
+                    "2. What are the biggest pain points or bottlenecks you face in your current operations today?\n"
+                    "3. How many people work in your organization, and what are the key departments or teams?\n"
+                    "4. What systems or tools do you currently use to manage your operations (spreadsheets, any software, manual registers)?\n"
+                    "5. What prompted you to look for an ERP solution now — what's the main problem you're trying to solve?"
+                )
 
         question = gathered.question or "What module or workflow should the ERP prioritize first?"
         summary_message = (
@@ -483,7 +488,97 @@ async def handle_project_chat(
             )
         )
 
-        gathered = _validate_gathering(await requirement_gatherer(requirement_session.analysis_json, conversation_history))
+        # ── Question Engine: evaluate user intent & coverage ────────
+        engine = QuestionEngine(
+            conversation_history=conversation_history,
+            analysis=requirement_session.analysis_json,
+            gathering_state=requirement_session.gathering_state or {},
+        )
+        decision = engine.evaluate(message)
+
+        # Persist engine state
+        requirement_session.gathering_state = decision["gathering_state"]
+
+        # Update completeness from actual coverage analysis
+        requirement_session.completeness_score = max(
+            requirement_session.completeness_score,
+            round(0.25 + decision["completeness"] * 0.75, 2),
+        )
+        project.requirement_completeness = requirement_session.completeness_score
+
+        # ── Action: warn_skip (user tried to skip, coverage too low)
+        if decision["action"] == "warn_skip":
+            warn_msg = decision["message"]
+            add_project_message(db, project.id, "assistant", warn_msg, agent="question_engine")
+            db.commit()
+            return ChatResponse(
+                response=warn_msg,
+                status=project.status,
+                current_module=requirement_session.current_module,
+                progress=f"Coverage: {int(decision['completeness'] * 100)}%",
+            )
+
+        # ── Action: allow_complete (user confirmed skip or coverage OK)
+        if decision["action"] == "allow_complete":
+            # Force the gatherer to compile requirements
+            gathered = _validate_gathering(
+                await requirement_gatherer(
+                    requirement_session.analysis_json,
+                    conversation_history,
+                    coverage_context=decision["coverage_context"],
+                    force_complete=True,
+                )
+            )
+            if gathered.complete and gathered.requirements:
+                normalized = _validate_requirements(gathered.requirements.model_dump())
+                requirement_session.normalized_requirements = normalized
+                requirement_session.status = "completed"
+                requirement_session.completeness_score = 1.0
+                project.requirement_completeness = 1.0
+                update_stage(project, "requirement_gathering", "complete", normalized)
+                db.commit()
+                return await _queue_generation(db, project, user, background_tasks)
+            # Fallback: compile from what we have
+            requirement_session.status = "completed"
+            requirement_session.completeness_score = 1.0
+            project.requirement_completeness = 1.0
+            update_stage(project, "requirement_gathering", "complete", requirement_session.normalized_requirements)
+            db.commit()
+            return await _queue_generation(db, project, user, background_tasks)
+
+        # ── Action: continue (normal answer, keep gathering)
+        # MINIMUM ROUNDS GUARD: Do NOT accept complete=true before enough rounds
+        MIN_GATHERING_ROUNDS = 5
+        gathered = _validate_gathering(
+            await requirement_gatherer(
+                requirement_session.analysis_json,
+                conversation_history,
+                coverage_context=decision["coverage_context"],
+            )
+        )
+
+        user_msg_count = len([m for m in conversation_history if m.get("role") == "user"])
+
+        if gathered.complete and user_msg_count < MIN_GATHERING_ROUNDS:
+            # LLM tried to complete too early — override and force more questions
+            gathered.complete = False
+            uncovered = decision.get("uncovered_areas", [])
+            if uncovered:
+                area_labels = [a["label"] for a in uncovered[:3]]
+                fallback_note = f"We still need to cover: {', '.join(area_labels)}.\n\n"
+            else:
+                fallback_note = ""
+            if not gathered.question:
+                gathered.question = (
+                    f"{fallback_note}"
+                    "Let me explore a few more areas to ensure we capture everything:\n\n"
+                    "1. How do you currently handle approvals — who authorizes purchases, expenses, and payments?\n"
+                    "2. What reports does management review regularly (daily, weekly, monthly)?\n"
+                    "3. Are there any regulatory or compliance requirements specific to your industry?\n"
+                    "4. Do you need the system to integrate with any external tools or services?\n"
+                    "5. What happens when things go wrong — how do you handle returns, cancellations, or exceptions?"
+                )
+
         if gathered.complete and gathered.requirements:
             normalized = _validate_requirements(gathered.requirements.model_dump())
             requirement_session.normalized_requirements = normalized
@@ -506,8 +601,6 @@ async def handle_project_chat(
         )
         requirement_session.current_module = gathered.current_module
         requirement_session.summary = gathered.progress_summary or question
-        requirement_session.completeness_score = min(requirement_session.completeness_score + 0.15, 0.9)
-        project.requirement_completeness = requirement_session.completeness_score
         add_project_message(db, project.id, "assistant", question, agent="requirement_gatherer")
         db.commit()
         return ChatResponse(

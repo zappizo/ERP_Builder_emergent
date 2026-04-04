@@ -123,6 +123,7 @@ class RequirementSession(Base, TimestampMixin):
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     analysis_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     normalized_requirements: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    gathering_state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
 
 class ClarificationQuestion(Base, TimestampMixin):

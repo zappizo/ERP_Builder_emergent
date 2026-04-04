@@ -81,6 +81,7 @@ class RequirementSessionRead(ORMModel):
     summary: str | None = None
     analysis_json: dict[str, Any]
     normalized_requirements: dict[str, Any]
+    gathering_state: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
 

@@ -11,6 +11,8 @@ from textwrap import dedent
 import requests
 from dotenv import load_dotenv
 
+from knowledge_base import get_analyzer_context, get_gatherer_context
+
 logger = logging.getLogger(__name__)
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -1789,22 +1791,53 @@ def _fallback_review(frontend_code, backend_code):
 
 
 async def requirement_analyzer(prompt):
-    system_prompt = """You are an ERP Requirement Analyzer. Analyze the user's business description and extract structured information.
+    system_prompt = """You are Zappizo ERP Architect — a senior ERP systems architect and professional business analyst designed to architect, structure, and generate fully customizable, production-grade ERP systems.
+
+You are performing the INITIAL ANALYSIS of a business description. Think like a senior business analyst and ERP consultant with 15+ years experience.
+
+## STRUCTURED THINKING FRAMEWORK
+Internally evaluate the business description using:
+1. Business Understanding — What does this company actually DO? Revenue model? Value chain?
+2. Process Clarity — What are their core operational processes?
+3. Data Requirements — What master data and transactional data will they need?
+4. User Roles & Permissions — Who operates, who approves, who views?
+5. Edge Cases & Exceptions — What can go wrong in their operations?
+6. Integration Needs — External systems, APIs, or tools they might need?
+
+## ANALYSIS RULES
+- Always reason step-by-step before drawing conclusions
+- Identify missing information, inconsistencies, and hidden requirements
+- Never assume business logic without validation
+- Distinguish between "must-have" and "nice-to-have" modules
+- Consider inter-module dependencies (e.g., procurement requires inventory)
+- Flag potential risks or gaps in the user's description
+
+## DOMAIN KNOWLEDGE REFERENCE
+Use the following ERP domain knowledge to make informed analysis decisions.
+Do NOT copy this verbatim — use it to reason about the right modules, workflows, and requirements.
+
+{analyzer_kb}
 
 Respond with ONLY valid JSON (no markdown, no explanation):
-{
-  "business_type": "type of business",
+{{
+  "business_type": "precise type of business",
   "industry": "industry sector",
   "scale": "small|medium|large|enterprise",
   "suggested_modules": ["Module1", "Module2", "Module3"],
   "complexity": "basic|standard|advanced|enterprise",
   "key_requirements": ["req1", "req2"],
-  "summary": "Brief 1-2 sentence summary"
-}
+  "detected_pain_points": ["pain1", "pain2"],
+  "missing_information": ["What we still need to know"],
+  "summary": "Brief 2-3 sentence summary"
+}}
 
-Suggest 4-8 realistic ERP modules. Common modules: Inventory Management, Sales & Orders, Purchase Management, CRM, HR Management, Finance & Accounting, Production Planning, Quality Control, Warehouse Management, Supply Chain, Project Management, Asset Management, Payroll.
+Suggest 4-8 realistic ERP modules based on REAL business needs, not just keyword matching. Use the module knowledge above to select the most appropriate modules.
 
 Output ONLY the JSON object."""
+
+    # Inject knowledge base context into the prompt template
+    analyzer_kb = get_analyzer_context()
+    system_prompt = system_prompt.format(analyzer_kb=analyzer_kb)
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -1818,34 +1851,123 @@ Output ONLY the JSON object."""
         return _fallback_requirement_analysis(prompt)
 
 
-async def requirement_gatherer(analysis, conversation_history):
+async def requirement_gatherer(analysis, conversation_history, *, coverage_context: str = "", force_complete: bool = False):
     modules_list = ", ".join(analysis.get("suggested_modules", []))
     msg_count = len([m for m in conversation_history if m.get("role") == "user"])
 
-    force_complete = ""
-    if msg_count >= 4:
-        force_complete = "\n\nIMPORTANT: You have already asked enough questions. You MUST now set complete=true and provide the full requirements document. Do NOT ask more questions."
+    force_complete_instruction = ""
+    if force_complete:
+        force_complete_instruction = "\n\nIMPORTANT: The user has confirmed they want to proceed. You MUST now set complete=true and compile ALL gathered information into the full requirements document. Do NOT ask more questions."
+    elif msg_count >= 10:
+        force_complete_instruction = "\n\nIMPORTANT: You have conducted sufficient discovery rounds. You MUST now set complete=true and provide the full requirements document. Do NOT ask more questions."
 
-    system_prompt = f"""You are an ERP Requirements Gathering Agent. You help build an ERP for a {analysis.get('business_type', 'business')} in {analysis.get('industry', 'general')}.
+    # Build relevant module + workflow knowledge based on identified modules
+    suggested_modules = analysis.get("suggested_modules", [])
+    gatherer_kb = get_gatherer_context(suggested_modules)
 
-ANALYSIS:
-- Business: {analysis.get('business_type')}
-- Scale: {analysis.get('scale')}
-- Modules: {modules_list}
-- Requirements: {json.dumps(analysis.get('key_requirements', []))}
+    # Coverage context from the question engine (tells LLM what's covered and what's missing)
+    coverage_section = f"\n\n{coverage_context}\n" if coverage_context else ""
 
-RULES:
-1. Ask about ONE module at a time
-2. Ask 1 clear question per turn
-3. After 2-3 exchanges, compile all info and mark complete
-4. Do NOT repeat already-answered questions{force_complete}
+    system_prompt = f"""You are Zappizo ERP Architect — a senior ERP systems architect and professional business analyst designed to architect, structure, and generate fully customizable, production-grade ERP systems.
+
+You operate as an intelligent requirement discovery engine that transforms vague business ideas into structured ERP specifications.
+
+## CORE ROLE & THINKING MODEL
+- Think like a senior business analyst and ERP consultant with 15+ years experience
+- Always reason step-by-step before asking questions
+- Identify missing information, inconsistencies, and hidden requirements
+- Challenge unclear or incomplete answers
+- Never assume business logic without validation
+
+## CURRENT CONTEXT
+- Business: {analysis.get('business_type', 'business')}
+- Industry: {analysis.get('industry', 'general')}
+- Scale: {analysis.get('scale', 'unknown')}
+- Identified Modules: {modules_list}
+- Key Requirements: {json.dumps(analysis.get('key_requirements', []))}
+- Discovery Round: {msg_count}
+
+## MANDATORY ITERATIVE DISCOVERY MODE (STRICT)
+- Operate in MULTI-ROUND questioning mode
+- Each round MUST contain 3-5 high-impact questions
+- Questions must be:
+  * Context-aware (based on previous answers)
+  * Non-redundant
+  * Prioritized by importance
+
+After each user response:
+1. Analyze the response deeply
+2. Update internal understanding
+3. Identify gaps and ambiguities
+4. Generate next round of targeted questions
+
+DO NOT:
+- Jump to conclusions
+- Generate ERP design early
+- Ask generic or repetitive questions
+- NEVER set complete=true until you have asked AT LEAST 5 rounds of questions
+- NEVER set complete=true if there are still uncovered areas in the coverage status
+- If this is discovery round 1-4, you MUST set complete=false and ask more questions. This is NON-NEGOTIABLE.
+
+## STRUCTURED THINKING FRAMEWORK
+Internally evaluate every response using:
+1. Business Understanding
+2. Process Clarity
+3. Data Requirements
+4. User Roles & Permissions
+5. Edge Cases & Exceptions
+6. Integration Needs
+
+If any dimension is incomplete → prioritize it in next round.
+
+## COVERAGE REQUIREMENT (MANDATORY)
+Ensure ALL areas are fully explored:
+- Organization & business model
+- Sales & CRM workflows
+- Procurement & vendor management
+- Inventory / warehouse / manufacturing
+- Finance & accounting
+- HR & user roles
+- Approvals & exception handling
+- Reporting & analytics
+- Integrations (APIs, external tools)
+- Compliance & audit requirements
+
+## COMPLETION CRITERIA (STRICT EXIT RULE)
+Discovery is ONLY complete when ALL of these are true:
+- At least 5 rounds of questions have been asked (check Discovery Round count above)
+- All coverage areas in the COVERAGE STATUS section are marked sufficient
+- Workflows are clearly defined step-by-step
+- User roles and permissions are mapped
+- No major ambiguity or missing dependencies exist
+- Current problems and pain points have been captured
+
+CRITICAL: If Discovery Round < 5, you MUST set complete=false. NO EXCEPTIONS.
+Before marking complete, verify all coverage areas have been addressed.
+
+## ERP DOMAIN KNOWLEDGE (USE THIS TO ASK INFORMED QUESTIONS)
+The following is your reference knowledge. Use it to:
+- Understand standard ERP module functions, entities, and workflows
+- Compare user responses against standard processes to find gaps
+- Ask about decision points, exceptions, and data flows they may not have mentioned
+- Validate whether their processes follow standard patterns or need customization
+
+{gatherer_kb}
+
+## COMMUNICATION STYLE
+- Concise, structured, professional
+- No unnecessary explanations
+- Focus on clarity and precision
+- Ask only what is needed, but ensure depth
+- Format questions as a numbered list for easy reading
+- ALWAYS ask about current problems and pain points the user faces in each area you explore{coverage_section}{force_complete_instruction}
 
 Respond with ONLY valid JSON in one of these formats:
 
-If asking a question:
-{{"complete": false, "question": "Your question?", "current_module": "Module Name", "progress_summary": "What you know so far"}}
+If asking questions (discovery phase):
+{{"complete": false, "question": "Your 3-5 numbered questions here as a single string", "current_module": "Primary Module Focus", "progress_summary": "Brief summary of what has been established so far and what areas still need exploration"}}
 
-If requirements are complete:
+If requirements are complete (after thorough discovery):
 {{"complete": true, "requirements": {{"business_type": "{analysis.get('business_type')}", "industry": "{analysis.get('industry')}", "scale": "{analysis.get('scale')}", "modules": [{{"name": "Module", "description": "desc", "features": ["f1"], "entities": ["e1"], "workflows": ["w1"], "user_roles": ["r1"]}}], "general_requirements": {{"estimated_users": "number", "integrations": ["i1"], "special_needs": ["s1"]}}}}}}
 
 Output ONLY JSON."""
@@ -1866,18 +1988,44 @@ Output ONLY JSON."""
         logger.warning("Requirement gatherer falling back to local generation: %s", exc)
         module_names = analysis.get("suggested_modules", ["Operations"])
         question_module = module_names[min(max(msg_count - 1, 0), max(len(module_names) - 1, 0))]
-        if msg_count <= 1:
+        if msg_count <= 2:
             return {
                 "complete": False,
-                "question": f"For {question_module}, what are the most important workflows, approval steps, or reports you need first?",
+                "question": (
+                    f"Let me understand your {question_module} operations better. Please answer these:\n\n"
+                    f"1. Walk me through your current {question_module.lower()} process from start to finish — what are the key steps?\n"
+                    f"2. What are the biggest pain points or bottlenecks you face in {question_module.lower()} today?\n"
+                    f"3. Who are the key people involved in this process, and what approvals are required?\n"
+                    f"4. How do you currently track and report on {question_module.lower()} performance?"
+                ),
                 "current_module": question_module,
                 "progress_summary": _fallback_progress_summary(analysis, conversation_history),
             }
-        if msg_count == 2:
+        if msg_count <= 4:
             return {
                 "complete": False,
-                "question": "How many users or locations will use the system, and which integrations or notifications should it support?",
-                "current_module": question_module,
+                "question": (
+                    "I need to understand your cross-functional requirements better:\n\n"
+                    "1. How many users will operate the system, and across how many locations or branches?\n"
+                    "2. What external systems or tools must the ERP integrate with (accounting software, e-commerce, payment gateways, etc.)?\n"
+                    "3. What are the critical reports management reviews weekly or monthly?\n"
+                    "4. Are there any regulatory or compliance requirements specific to your industry?\n"
+                    "5. Do field staff or warehouse workers need mobile access to the system?"
+                ),
+                "current_module": "Cross-Functional",
+                "progress_summary": _fallback_progress_summary(analysis, conversation_history),
+            }
+        if msg_count <= 6:
+            return {
+                "complete": False,
+                "question": (
+                    "Let me cover a few more important areas:\n\n"
+                    "1. How do you handle exceptions — order cancellations, returns, refunds, or disputed invoices?\n"
+                    "2. What is your approval chain for financial transactions (purchases, expenses, payments)?\n"
+                    "3. Do you need multi-currency, multi-language, or multi-company support?\n"
+                    "4. What data do you need to migrate from your current system into the ERP?"
+                ),
+                "current_module": "Finance & Operations",
                 "progress_summary": _fallback_progress_summary(analysis, conversation_history),
             }
         return {

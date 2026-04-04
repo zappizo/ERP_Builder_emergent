@@ -1,0 +1,8 @@
+﻿19:     requirement_analyzer,
+20:     requirement_gatherer,
+407:         analysis = _validate_analysis(await requirement_analyzer(seed))
+416:         gathered = _validate_gathering(await requirement_gatherer(analysis, conversation_history))
+455:         add_project_message(db, project.id, "assistant", summary_message, agent="requirement_gatherer")
+525:                 await requirement_gatherer(
+553:             await requirement_gatherer(
+604:         add_project_message(db, project.id, "assistant", question, agent="requirement_gatherer")
