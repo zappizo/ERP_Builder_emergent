@@ -160,57 +160,7 @@ export default function ChatPanel({
         </p>
       </div>
 
-      <div className="px-4 py-3 border-b border-[var(--zap-border)] bg-[var(--zap-bg)]/60" data-testid="live-process-card">
-        <div className="rounded-sm border border-[var(--zap-border)] bg-white p-3 space-y-2">
-          <div className="flex items-center justify-between gap-3">
-            <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-[var(--zap-text-muted)]">
-              Live Process
-            </p>
-            <span className="text-[10px] uppercase tracking-[0.14em] text-[var(--zap-text-muted)]">
-              {projectStatus || "INIT"}
-            </span>
-          </div>
-          <div>
-            <p className="text-sm font-semibold text-[var(--zap-text-heading)]">{stageInfo.title}</p>
-            <p className="mt-1 text-xs leading-relaxed text-[var(--zap-text-body)]">{liveSummary}</p>
-          </div>
-          <div className="space-y-1.5 text-xs text-[var(--zap-text-body)]">
-            <p><span className="font-medium text-[var(--zap-text-heading)]">Model:</span> {liveModel}</p>
-            <p><span className="font-medium text-[var(--zap-text-heading)]">API:</span> {stageInfo.api}</p>
-            <p><span className="font-medium text-[var(--zap-text-heading)]">Next:</span> {liveAction}</p>
-            {discoveryPercent !== null && ["ANALYZING", "GATHERING", "COMPLETE"].includes(projectStatus) && (
-              <p><span className="font-medium text-[var(--zap-text-heading)]">Coverage:</span> {discoveryPercent}%</p>
-            )}
-            {latestAssistantMessage && (
-              <p><span className="font-medium text-[var(--zap-text-heading)]">Latest update:</span> {summarizeMessage(latestAssistantMessage)}</p>
-            )}
-          </div>
-          {capturedTopics.length > 0 && (
-            <div className="flex flex-wrap gap-1.5 pt-1">
-              {capturedTopics.map((topic) => (
-                <span
-                  key={`captured-${topic}`}
-                  className="rounded-full bg-[var(--zap-accent)]/10 px-2 py-1 text-[10px] font-medium text-[var(--zap-accent)]"
-                >
-                  {topic}
-                </span>
-              ))}
-            </div>
-          )}
-          {missingTopics.length > 0 && (
-            <div className="flex flex-wrap gap-1.5 pt-1">
-              {missingTopics.map((topic) => (
-                <span
-                  key={`missing-${topic}`}
-                  className="rounded-full border border-[var(--zap-border)] px-2 py-1 text-[10px] font-medium text-[var(--zap-text-body)]"
-                >
-                  Need: {topic}
-                </span>
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
+
 
       {/* Messages */}
       <ScrollArea ref={scrollRef} className="flex-1 px-4 py-3">

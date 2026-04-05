@@ -1874,6 +1874,7 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
 
         project.status = "ARCHITECTING"
         update_stage(project, "architecture", "running")
+        add_project_message(db, project.id, "assistant", "Analyzing gathered requirements and drafting the preliminary ERP architecture... This will take a moment.", agent="erp_architect")
         db.commit()
 
         architecture = _validate_architecture(
@@ -1904,6 +1905,7 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
         project.status = "TRANSFORMING"
         job.current_stage = "json_transform"
         update_stage(project, "json_transform", "running")
+        add_project_message(db, project.id, "assistant", "Solidifying architecture into strict JSON schema structure...", agent="json_transformer")
         db.commit()
 
         master_json = _validate_master_json(
@@ -1940,6 +1942,8 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
         job.current_stage = "frontend_generation"
         update_stage(project, "frontend_generation", "running")
         update_stage(project, "backend_generation", "running")
+        add_project_message(db, project.id, "assistant", "Translating schema into comprehensive React + Tailwind frontend code components. Depending on the size of your platform, this may take up to 2-3 minutes...", agent="frontend_generator")
+        add_project_message(db, project.id, "assistant", "Generating FastAPI models, routers, and logic blocks... Hang tight, we are almost done!", agent="backend_generator")
         db.commit()
 
         frontend_bundle, backend_bundle = await generate_code_bundles(
